@@ -1,0 +1,10 @@
+# Local captures and diagnostics
+*.json
+!manifest.json
+
+# OS/editor files
+.DS_Store
+
+# Local unpacked-extension state
+.crx
+*.pem
