@@ -1,6 +1,7 @@
 import {DEFAULT_SETTINGS, SETTINGS_STORAGE_KEY} from "./settings.js";
 const jsonInput = document.querySelector("#format-json");
 const csvInput = document.querySelector("#format-csv");
+const rawJsonInput = document.querySelector("#format-raw-json");
 const startButton = document.querySelector("#start");
 const stopButton = document.querySelector("#stop");
 const statusTitle = document.querySelector("#status-title");
@@ -17,8 +18,9 @@ async function saveFormats() {
   const current = await settings();
   current.export_json = jsonInput.checked;
   current.export_csv = csvInput.checked;
+  current.export_raw_json = rawJsonInput.checked;
   await chrome.storage.local.set({[SETTINGS_STORAGE_KEY]: current});
-  formatError.hidden = current.export_json || current.export_csv;
+  formatError.hidden = current.export_json || current.export_csv || current.export_raw_json;
   return current;
 }
 
@@ -27,6 +29,7 @@ function renderState(state) {
   stopButton.hidden = !state.running;
   jsonInput.disabled = state.running;
   csvInput.disabled = state.running;
+  rawJsonInput.disabled = state.running;
   statusDot.className = `status-dot ${state.running ? "running" : ""}`;
   statusTitle.textContent = state.running
     ? `${state.item_count || 0} items captured`
@@ -38,15 +41,18 @@ async function initialize() {
   const current = await settings();
   jsonInput.checked = current.export_json;
   csvInput.checked = current.export_csv;
+  rawJsonInput.checked = current.export_raw_json;
   const state = await chrome.runtime.sendMessage({type: "get-state"});
   renderState(state || {running: false});
 }
 
-for (const input of [jsonInput, csvInput]) input.addEventListener("change", saveFormats);
+for (const input of [jsonInput, csvInput, rawJsonInput]) {
+  input.addEventListener("change", saveFormats);
+}
 
 startButton.addEventListener("click", async () => {
   const current = await saveFormats();
-  if (!current.export_json && !current.export_csv) return;
+  if (!current.export_json && !current.export_csv && !current.export_raw_json) return;
   startButton.disabled = true;
   const response = await chrome.runtime.sendMessage({type: "start"});
   startButton.disabled = false;

@@ -32,11 +32,18 @@ let activeTabId = null;
 let running = false;
 let scrollTimer = null;
 let scrollInFlight = false;
+let pausedForHiddenTab = false;
 let scrollStepCount = 0;
 let matchingResponseCount = 0;
+let validatedCollectionResponseCount = 0;
 let processedPageCount = 0;
 let morePagesAvailable = null;
 let cursorRequestFailures = 0;
+let currentCaptureMethod = "automatic";
+let graphQLRequestTemplate = null;
+let paginationCursor = null;
+let forceDirectFallbackForTest = false;
+let fallbackNotificationId = null;
 let currentCollectionName = "Collection";
 let currentCollectionPk = null;
 let currentRunId = null;
@@ -194,8 +201,17 @@ async function runScrollOnlyPageOperation(operation, payload = {}) {
         if (!overlay) {
           overlay = document.createElement('div');
           overlay.id = id;
-          overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:wait;background:rgba(0,0,0,.38);pointer-events:none;';
+          overlay.tabIndex = 0;
+          overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:wait;background:rgba(0,0,0,.38);pointer-events:auto;overscroll-behavior:contain;';
+          const blockInput = (event) => {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          };
+          for (const eventName of ['click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu', 'wheel', 'touchmove', 'keydown', 'keyup']) {
+            overlay.addEventListener(eventName, blockInput, {capture: true, passive: false});
+          }
           document.documentElement.appendChild(overlay);
+          overlay.focus({preventScroll: true});
         }
         overlay.innerHTML = '<div style="position:fixed;left:18px;bottom:18px;padding:10px 14px;border-radius:10px;color:#fff;background:rgba(24,20,38,.94);font:13px system-ui,sans-serif;">📚 StashTable<br><span></span></div>';
         overlay.querySelector('span').textContent = String(data.message);
@@ -454,7 +470,10 @@ async function updateOutboxBadge() {
     : capturedItemCount(stored[CAPTURE_STORAGE_KEY]);
   const failed = outbox.filter((item) => item.permanent_error).length;
   const ingestionEnabled = await ingestionIsEnabled();
-  if (ingestionEnabled && failed) {
+  if (running && pausedForHiddenTab) {
+    await chrome.action.setBadgeBackgroundColor({color: "#b54708"});
+    await chrome.action.setBadgeText({text: "TAB"});
+  } else if (ingestionEnabled && failed) {
     await chrome.action.setBadgeBackgroundColor({color: "#b42318"});
     await chrome.action.setBadgeText({text: "!"});
   } else if (ingestionEnabled && outbox.length) {
@@ -589,10 +608,19 @@ async function setPageOverlay(message, visible) {
       if (!overlay) {
         overlay = document.createElement('div');
         overlay.id = id;
-        // Keep the dim layer visible without intercepting the synthetic scroll
-        // gesture used to trigger Instagram's infinite-scroll loader.
-        overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:wait;background:rgba(0,0,0,.38);pointer-events:none;';
+        overlay.tabIndex = 0;
+        // Runtime.evaluate scrolls the document directly, so this layer can
+        // safely block the user's pointer and wheel input during capture.
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:wait;background:rgba(0,0,0,.38);pointer-events:auto;overscroll-behavior:contain;';
+        const blockInput = (event) => {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        };
+        for (const eventName of ['click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu', 'wheel', 'touchmove', 'keydown', 'keyup']) {
+          overlay.addEventListener(eventName, blockInput, {capture: true, passive: false});
+        }
         document.documentElement.appendChild(overlay);
+        overlay.focus({preventScroll: true});
       }
       overlay.innerHTML = '<div style="position:fixed;left:18px;bottom:18px;padding:10px 14px;border-radius:10px;color:#fff;background:rgba(24,20,38,.94);font:13px system-ui,sans-serif;">📚 StashTable<br><span></span></div>';
       overlay.querySelector('span').textContent = ${encodedMessage};
@@ -725,13 +753,237 @@ async function scrollToCurrentBottom() {
   return result?.result?.value || null;
 }
 
-async function waitForProcessedPage(previousCount, timeoutMs = PAGE_RESPONSE_TIMEOUT_MS) {
+async function waitForProcessedPage(
+  previousCount,
+  timeoutMs = PAGE_RESPONSE_TIMEOUT_MS,
+  pauseWhenHidden = true,
+) {
   const deadline = Date.now() + timeoutMs;
   while (running && Date.now() < deadline) {
-    if (processedPageCount > previousCount) return true;
+    if (processedPageCount > previousCount) return "received";
+    if (pauseWhenHidden && !(await collectionPageIsVisible())) return "hidden";
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  return false;
+  return "timeout";
+}
+
+function directRequestsEnabled() {
+  return currentCaptureMethod === "automatic" || currentCaptureMethod === "requests";
+}
+
+function scrollingEnabled() {
+  return currentCaptureMethod === "automatic" || currentCaptureMethod === "scroll";
+}
+
+function safeReplayHeaders(headers = {}) {
+  const allowed = new Set([
+    "content-type", "x-asbd-id", "x-csrftoken", "x-fb-friendly-name",
+    "x-fb-lsd", "x-ig-app-id", "x-ig-www-claim", "x-requested-with",
+  ]);
+  return Object.fromEntries(
+    Object.entries(headers).filter(([name]) => allowed.has(name.toLowerCase())),
+  );
+}
+
+function graphQLPostDataWithCursor(postData, cursor) {
+  const form = new URLSearchParams(postData);
+  const variables = JSON.parse(form.get("variables") || "{}");
+  variables.after = cursor;
+  form.set("variables", JSON.stringify(variables));
+  return form.toString();
+}
+
+async function replayGraphQLPage(cursor) {
+  if (!graphQLRequestTemplate || !cursor) {
+    throw new Error("No observed Instagram GraphQL pagination template is available.");
+  }
+  const postData = graphQLPostDataWithCursor(graphQLRequestTemplate.postData, cursor);
+  const encodedUrl = JSON.stringify(graphQLRequestTemplate.url);
+  const encodedHeaders = JSON.stringify(safeReplayHeaders(graphQLRequestTemplate.headers));
+  const encodedBody = JSON.stringify(postData);
+  await appendLog("graphql_replay_started", {cursor});
+  const result = await chrome.debugger.sendCommand({tabId: activeTabId}, "Runtime.evaluate", {
+    expression: `(async () => {
+      try {
+        const response = await fetch(${encodedUrl}, {
+          method: 'POST', credentials: 'include', headers: ${encodedHeaders}, body: ${encodedBody},
+        });
+        await response.text();
+        return {ok: response.ok, status: response.status};
+      } catch (error) {
+        return {ok: false, error: String(error)};
+      }
+    })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  const outcome = result?.result?.value || {};
+  if (!outcome.ok) {
+    throw new Error(outcome.error || `Instagram returned HTTP ${outcome.status}`);
+  }
+  await appendLog("graphql_replay_accepted", {cursor, status: outcome.status});
+}
+
+async function focusCollectionTab() {
+  if (activeTabId === null) return false;
+  try {
+    const tab = await chrome.tabs.get(activeTabId);
+    if (tab.windowId === undefined) return false;
+    await chrome.windows.update(tab.windowId, {focused: true});
+    await chrome.tabs.update(activeTabId, {active: true});
+    await appendLog("collection_tab_focused_for_fallback");
+    return true;
+  } catch (error) {
+    await appendLog("collection_tab_focus_failed", {error: error.message});
+    return false;
+  }
+}
+
+async function notifyScrollingFallback() {
+  fallbackNotificationId = `stashtable-fallback-${currentRunId}`;
+  await chrome.notifications.create(fallbackNotificationId, {
+    type: "basic",
+    iconUrl: chrome.runtime.getURL("icons/icon.png"),
+    title: "StashTable needs the collection tab",
+    message: "Direct requests stopped. Click to return to Instagram and continue by scrolling.",
+    priority: 2,
+    requireInteraction: true,
+  });
+  await appendLog("scroll_fallback_notification_sent");
+}
+
+async function waitForScrollingCatchUp(previousResponses, previousPages) {
+  const deadline = Date.now() + PAGE_RESPONSE_TIMEOUT_MS;
+  while (running && Date.now() < deadline) {
+    if (processedPageCount > previousPages) return "new";
+    if (validatedCollectionResponseCount > previousResponses) return "duplicate";
+    if (!(await collectionPageIsVisible())) return "hidden";
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return "timeout";
+}
+
+async function catchUpScrollingAfterDirectFailure() {
+  if (!running || scrollInFlight) return;
+  scrollInFlight = true;
+  try {
+    while (running) {
+      if (await pauseWhileCollectionTabIsHidden()) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      const previousResponses = validatedCollectionResponseCount;
+      const previousPages = processedPageCount;
+      await scrollToCurrentBottom();
+      scrollStepCount += 1;
+      sendStatus("Scrolling through pages already captured by direct requests.");
+      const result = await waitForScrollingCatchUp(previousResponses, previousPages);
+      if (result === "hidden") continue;
+      if (result === "duplicate") {
+        await appendLog("scroll_fallback_duplicate_page", {step: scrollStepCount});
+        continue;
+      }
+      if (result === "new") {
+        await appendLog("scroll_fallback_caught_up", {step: scrollStepCount});
+        scrollInFlight = false;
+        requestScroll();
+        return;
+      }
+      throw new Error("No collection response appeared while scrolling caught up.");
+    }
+  } catch (error) {
+    if (running) {
+      await stop("scroll_fallback_failed", {error: error.message});
+    }
+  } finally {
+    scrollInFlight = false;
+  }
+}
+
+async function runDirectPagination() {
+  if (!running || scrollInFlight) return;
+  scrollInFlight = true;
+  try {
+    while (running && morePagesAvailable !== false) {
+      if (forceDirectFallbackForTest) {
+        forceDirectFallbackForTest = false;
+        throw new Error("Automatic fallback was triggered from Advanced Settings.");
+      }
+      if (!paginationCursor || !graphQLRequestTemplate) {
+        throw new Error("Instagram did not provide a replayable pagination request.");
+      }
+      const pagesBeforeRequest = processedPageCount;
+      const requestedCursor = paginationCursor;
+      sendStatus("Requesting the next collection page in the background.");
+      await replayGraphQLPage(requestedCursor);
+      const pageResult = await waitForProcessedPage(
+        pagesBeforeRequest, PAGE_RESPONSE_TIMEOUT_MS, false,
+      );
+      if (pageResult !== "received") {
+        throw new Error("The replayed GraphQL response was not captured.");
+      }
+      sendStatus(`Page ${processedPageCount} recorded locally.`);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (running && morePagesAvailable === false) {
+      await stop("instagram_no_more_pages");
+    }
+  } catch (error) {
+    await appendLog("direct_pagination_failed", {error: error.message});
+    if (currentCaptureMethod === "automatic" && running) {
+      sendStatus("Direct requests stopped. Return to the collection tab to continue scrolling.");
+      currentCaptureMethod = "scroll";
+      scrollInFlight = false;
+      if (!(await collectionPageIsVisible())) {
+        await notifyScrollingFallback();
+      }
+      catchUpScrollingAfterDirectFailure();
+      return;
+    }
+    if (running) {
+      sendStatus(`Direct pagination failed: ${error.message}`);
+      await stop("direct_pagination_failed", {error: error.message});
+    }
+  } finally {
+    scrollInFlight = false;
+  }
+}
+
+async function collectionPageIsVisible() {
+  if (activeTabId === null) return false;
+  try {
+    const result = await chrome.debugger.sendCommand(
+      {tabId: activeTabId},
+      "Runtime.evaluate",
+      {
+        expression: "document.visibilityState === 'visible'",
+        returnByValue: true,
+      },
+    );
+    return result?.result?.value === true;
+  } catch {
+    return false;
+  }
+}
+
+async function pauseWhileCollectionTabIsHidden() {
+  if (await collectionPageIsVisible()) {
+    if (pausedForHiddenTab) {
+      pausedForHiddenTab = false;
+      await appendLog("capture_resumed_visible_tab");
+      sendStatus("Collection tab is visible again; resuming capture.");
+      await updateOutboxBadge();
+    }
+    return false;
+  }
+
+  if (!pausedForHiddenTab) {
+    pausedForHiddenTab = true;
+    await appendLog("capture_paused_hidden_tab");
+    sendStatus("Capture paused; return to the Instagram collection tab to continue.");
+    await updateOutboxBadge();
+  }
+  return true;
 }
 
 async function waitForCollectionContent(timeoutMs = INITIAL_LOADING_INDICATOR_WAIT_MS) {
@@ -902,6 +1154,14 @@ async function captureResponseBody(requestId, metadata) {
         morePagesAvailable = Boolean(page.moreAvailable);
       }
       nextMaxId = page.moreAvailable && page.nextCursor ? page.nextCursor : null;
+      paginationCursor = page.moreAvailable ? page.nextCursor : null;
+      if (isGraphQLUrl(metadata.url) && metadata.postData) {
+        graphQLRequestTemplate = {
+          url: metadata.url,
+          postData: metadata.postData,
+          headers: metadata.requestHeaders,
+        };
+      }
       console.info("StashTable collection page", {
         url: metadata.url,
         itemCount: page.items.length,
@@ -926,7 +1186,10 @@ async function captureResponseBody(requestId, metadata) {
       body,
     };
     const key = pageKey(metadata.url, metadata.postData, body);
-    if (capturedPageKeys.has(key)) return;
+    if (capturedPageKeys.has(key)) {
+      validatedCollectionResponseCount += 1;
+      return;
+    }
     capturedPageKeys.add(key);
     await appendLog("response_captured", {
       requestUrl: metadata.url,
@@ -935,6 +1198,7 @@ async function captureResponseBody(requestId, metadata) {
     const pageIndex = processedPageCount;
     await storeCapture(payload, pageIndex);
     processedPageCount += 1;
+    validatedCollectionResponseCount += 1;
     // Raw uploads and normalization are independent of Instagram pagination.
     if (nextMaxId) {
       await requestNextPage(metadata.url, nextMaxId, metadata.requestHeaders);
@@ -1073,7 +1337,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
 async function start(tab) {
   const settings = await userSettings();
-  if (!settings.export_json && !settings.export_csv) {
+  if (!settings.export_json && !settings.export_csv && !settings.export_raw_json) {
     return {message: "Select at least one export format first.", running: false};
   }
   if (!tab?.id || !tab.url?.includes("instagram.com")) {
@@ -1100,13 +1364,20 @@ async function start(tab) {
   scrollInFlight = false;
   scrollStepCount = 0;
   matchingResponseCount = 0;
+  validatedCollectionResponseCount = 0;
   processedPageCount = 0;
+  pausedForHiddenTab = false;
   morePagesAvailable = null;
   cursorRequestFailures = 0;
+  graphQLRequestTemplate = null;
+  paginationCursor = null;
+  forceDirectFallbackForTest = false;
+  fallbackNotificationId = null;
   currentCollectionName = collectionNameFromUrl(tab.url);
   currentCollectionPk = collectionPk;
   currentRunId = crypto.randomUUID();
   currentStartedAt = new Date().toISOString();
+  currentCaptureMethod = settings.capture_method || "scroll";
   pendingResponseBodies.clear();
   requestHeadersById.clear();
   targetRequestsById.clear();
@@ -1136,25 +1407,48 @@ async function start(tab) {
     requestScrollOnly();
     return {message: "Scroll-only mode started.", running: true};
   }
-  sendStatus(USE_CURSOR_REQUESTS
-    ? "Capturing responses and following pagination cursors."
-    : "Capturing responses with infinite scrolling.");
+  sendStatus(currentCaptureMethod === "scroll"
+    ? "Capturing responses with infinite scrolling."
+    : "Capturing responses and preparing direct pagination.");
   // The initial collection request may have happened before the debugger was
   // attached. Reload so that request is emitted while Network capture is on.
   await chrome.tabs.reload(activeTabId);
   sendStatus("Waiting for the initial collection response.");
-  const receivedInitialPage = await waitForProcessedPage(0);
+  let initialPageResult = await waitForProcessedPage(0);
+  while (running && initialPageResult === "hidden") {
+    await pauseWhileCollectionTabIsHidden();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (!(await collectionPageIsVisible())) continue;
+    await pauseWhileCollectionTabIsHidden();
+    await chrome.tabs.reload(activeTabId);
+    sendStatus("Waiting for the initial collection response.");
+    initialPageResult = await waitForProcessedPage(0);
+  }
   if (!running) {
     return {message: "Stopped.", running: false};
   }
-  if (!receivedInitialPage) {
+  if (initialPageResult !== "received") {
     sendStatus("The initial collection response did not appear; stopping.");
     await stop("initial_collection_response_timeout");
     return {message: "Initial collection response timed out.", running: false};
   }
   sendStatus("Initial page recorded locally.");
   await setPageOverlay("Collecting posts…", true);
-  requestScroll();
+  if (directRequestsEnabled() && graphQLRequestTemplate && paginationCursor) {
+    runDirectPagination();
+  } else if (scrollingEnabled()) {
+    if (currentCaptureMethod === "automatic") {
+      await appendLog("direct_pagination_unavailable", {
+        reason: "missing_graphql_template_or_cursor",
+      });
+      currentCaptureMethod = "scroll";
+    }
+    requestScroll();
+  } else if (morePagesAvailable === false) {
+    await stop("instagram_no_more_pages");
+  } else {
+    await stop("direct_pagination_unavailable");
+  }
   return {message: "Started.", running: true};
 }
 
@@ -1204,6 +1498,8 @@ async function requestScroll() {
   }
   scrollInFlight = true;
   try {
+    if (await pauseWhileCollectionTabIsHidden()) return;
+
     if (morePagesAvailable === false) {
       console.info("StashTable stopping: Instagram reported no more collection pages");
       sendStatus("Instagram reported no more pages; finishing capture.");
@@ -1225,8 +1521,12 @@ async function requestScroll() {
       matchingResponseCount,
     });
     sendStatus("Waiting for the next collection response.");
-    const receivedPage = await waitForProcessedPage(pagesBeforeScroll);
-    if (!receivedPage) {
+    const pageResult = await waitForProcessedPage(pagesBeforeScroll);
+    if (pageResult === "hidden") {
+      await pauseWhileCollectionTabIsHidden();
+      return;
+    }
+    if (pageResult !== "received") {
       sendStatus("No collection response appeared after scrolling; stopping.");
       await stop("collection_response_timeout_after_scroll");
       return;
@@ -1239,7 +1539,7 @@ async function requestScroll() {
   } finally {
     scrollInFlight = false;
     if (running) {
-      scrollTimer = setTimeout(requestScroll, 100);
+      scrollTimer = setTimeout(requestScroll, pausedForHiddenTab ? 500 : 100);
     }
   }
 }
@@ -1284,8 +1584,16 @@ async function stop(reason = "stopped_by_user", details = {}) {
   await appendLog("run_stopped", summary);
   running = false;
   scrollInFlight = false;
+  pausedForHiddenTab = false;
   morePagesAvailable = null;
   cursorRequestFailures = 0;
+  graphQLRequestTemplate = null;
+  paginationCursor = null;
+  forceDirectFallbackForTest = false;
+  if (fallbackNotificationId) {
+    await chrome.notifications.clear(fallbackNotificationId);
+    fallbackNotificationId = null;
+  }
   pendingResponseBodies.clear();
   requestHeadersById.clear();
   targetRequestsById.clear();
@@ -1328,6 +1636,22 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === OUTBOX_ALARM) scheduleOutboxPump();
 });
 
+chrome.notifications.onClicked.addListener((notificationId) => {
+  if (!fallbackNotificationId || notificationId !== fallbackNotificationId) return;
+  const clickedNotificationId = fallbackNotificationId;
+  focusCollectionTab().then(async (focused) => {
+    if (focused) {
+      sendStatus("Collection tab opened; scrolling fallback is resuming.");
+    } else {
+      sendStatus("Could not focus the collection tab. Open it manually to continue.");
+    }
+    await chrome.notifications.clear(clickedNotificationId);
+    if (fallbackNotificationId === clickedNotificationId) {
+      fallbackNotificationId = null;
+    }
+  });
+});
+
 chrome.runtime.onStartup.addListener(() => scheduleOutboxPump());
 chrome.runtime.onInstalled.addListener(async () => {
   const stored = await chrome.storage.local.get(SETTINGS_STORAGE_KEY);
@@ -1345,7 +1669,7 @@ async function exportCaptures(summary = null) {
   const stored = await chrome.storage.local.get({[CAPTURE_STORAGE_KEY]: []});
   const pages = stored[CAPTURE_STORAGE_KEY];
   const settings = await userSettings();
-  if (!settings.export_json && !settings.export_csv) {
+  if (!settings.export_json && !settings.export_csv && !settings.export_raw_json) {
     throw new Error("Select at least one export format.");
   }
   const normalized = normalizeCapture(pages, {
@@ -1372,11 +1696,26 @@ async function exportCaptures(summary = null) {
       saveAs: false,
     }));
   }
+  if (settings.export_raw_json) {
+    const rawCapture = {
+      platform: "instagram",
+      collection_name: normalized.collection.name,
+      collection_pk: normalized.collection.platform_collection_id,
+      page_count: pages.length,
+      pages: [...pages].sort((left, right) => left.page_index - right.page_index),
+    };
+    downloads.push(chrome.downloads.download({
+      url: `data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(rawCapture, null, 2))}`,
+      filename: `${basename} - Raw pages.json`,
+      saveAs: false,
+    }));
+  }
   await Promise.all(downloads);
   return {
     message: `Exported ${normalized.items.length} items as ${[
       settings.export_json && "JSON",
       settings.export_csv && "CSV",
+      settings.export_raw_json && "raw JSON",
     ].filter(Boolean).join(" and ")}.`,
   };
 }
@@ -1398,6 +1737,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "outbox-cleared") {
     updateOutboxBadge().then(() => sendResponse({ok: true}));
     return true;
+  }
+  if (message.type === "test-automatic-fallback") {
+    if (!running || currentCaptureMethod !== "automatic") {
+      sendResponse({
+        ok: false,
+        message: "Start a capture in Automatic fallback mode before running this test.",
+      });
+      return false;
+    }
+    forceDirectFallbackForTest = true;
+    sendResponse({
+      ok: true,
+      message: "Fallback test armed. A notification will ask you to return to the collection tab.",
+    });
+    return false;
   }
   if (message.type === "start") {
     chrome.tabs.query({active: true, currentWindow: true}).then(([tab]) => start(tab))

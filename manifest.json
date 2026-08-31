@@ -2,12 +2,13 @@
   "manifest_version": 3,
   "name": "StashTable",
   "description": "Export Instagram saved collections as normalized JSON or CSV files.",
-  "version": "0.2.2",
+  "version": "0.3.2",
   "permissions": [
     "activeTab",
     "alarms",
     "debugger",
     "downloads",
+    "notifications",
     "scripting",
     "storage",
     "unlimitedStorage"

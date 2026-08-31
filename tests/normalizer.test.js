@@ -21,6 +21,8 @@ test("defaults to JSON-only local export", () => {
   assert.deepEqual(DEFAULT_SETTINGS, {
     export_json: true,
     export_csv: false,
+    export_raw_json: false,
+    capture_method: "scroll",
     ingestion_enabled: false,
   });
 });

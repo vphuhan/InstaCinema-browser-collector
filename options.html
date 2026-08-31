@@ -11,6 +11,16 @@
       <h1>StashTable advanced settings</h1>
       <p class="intro">Local exports do not require a server. Enable ingestion only when you run a compatible API on your computer.</p>
       <section class="panel">
+        <label for="capture-method"><strong>Capture Mode</strong></label>
+        <select id="capture-method">
+          <option value="scroll">Scrolling (default)</option>
+          <option value="automatic">Auto (Beta)</option>
+          <option value="requests">Direct (Beta)</option>
+        </select>
+        <p id="capture-method-help" class="muted"></p>
+        <button id="test-fallback" class="secondary test-button">Test automatic fallback</button>
+      </section>
+      <section class="panel">
         <label class="toggle-row">
           <span><strong>Upload raw pages to local API</strong><small>Send captures to http://127.0.0.1:8000 for background processing.</small></span>
           <input id="ingestion" type="checkbox">
@@ -22,7 +32,7 @@
         <p><span id="pending-count">0</span> requests are stored locally.</p>
         <button id="clear-outbox" class="secondary">Clear pending uploads</button>
       </section>
-      <p id="save-status" class="success" aria-live="polite"></p>
+      <p id="save-status" class="setting-status" aria-live="polite"></p>
     </main>
     <script type="module" src="options.js"></script>
   </body>

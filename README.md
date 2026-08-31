@@ -23,8 +23,8 @@ package installation is required.
 2. Open one specific saved collection. Its URL should resemble:
    `https://www.instagram.com/<username>/saved/<name>/<collection-id>/`.
 3. Click the extension icon.
-4. Keep **Normalized JSON** selected, optionally select **CSV table**, and click
-   **Start capture**.
+4. Keep **Normalized JSON** selected, optionally select **CSV table** or
+   **Raw response pages (JSON)**, and click **Start capture**.
 5. Leave that Instagram tab open while the dim overlay is visible.
 
 The extension stops when Instagram reports that no more pages are available.
@@ -35,6 +35,7 @@ Files are downloaded automatically:
 ```text
 Instagram - <Collection name> (YYYY-MM-DD HH-MM-SS).json
 Instagram - <Collection name> (YYYY-MM-DD HH-MM-SS).csv
+Instagram - <Collection name> (YYYY-MM-DD HH-MM-SS) - Raw pages.json
 ```
 
 JSON is selected by default. Export choices are remembered for the next run.
@@ -68,6 +69,12 @@ stored as JSON arrays inside their cells so carousel data is not discarded.
 CSV files are UTF-8 and compatible with Excel, Numbers, Google Sheets, and
 LibreOffice.
 
+Raw response pages preserves the captured Instagram response envelopes in page
+order. Its top level contains `platform`, `collection_name`, `collection_pk`,
+`page_count`, and `pages`. This option is intended for debugging, archival, or
+custom processing; these payloads are platform-specific and considerably larger
+than normalized exports.
+
 Instagram media URLs may be signed and can expire. The post's canonical URL and
 stable Instagram identifiers remain in the export.
 
@@ -98,6 +105,25 @@ ingestion prevents new uploads and preserves existing pending requests until
 you re-enable ingestion or explicitly clear them. Cloud credentials must remain
 in the local backend and must never be added to this extension.
 
+## Capture methods
+
+Advanced Settings provides three capture methods:
+
+- **Scrolling only** (default) uses the visible Instagram page and pauses when the
+  collection tab is hidden.
+- **Auto (Beta)** starts with observed GraphQL requests. If they fail while the
+  collection tab is hidden, it sends a desktop notification and displays `TAB`
+  on the badge. Clicking the notification returns to Instagram while scrolling
+  catches up through pages already captured in the background.
+- **Direct (Beta)** uses only the observed GraphQL request and
+  can continue while another tab or application is active. It stops with a
+  visible error instead of falling back if Instagram rejects the replay.
+
+Request templates exist only in memory for the active run. StashTable changes
+the GraphQL pagination cursor, keeps authentication inside Instagram's page
+context, and does not export request headers, cookies, CSRF tokens, or session
+IDs.
+
 ## Permissions and privacy
 
 - `debugger`: reads collection response bodies from the selected Instagram tab.
@@ -105,11 +131,13 @@ in the local backend and must never be added to this extension.
 - `storage` and `unlimitedStorage`: retain the active capture and optional
   pending uploads.
 - `downloads`: save selected export formats.
+- `notifications`: ask you to return when Auto needs visible-tab scrolling.
 - `alarms`: resume optional pending uploads.
 
 Chromium displays a debugger notification during capture and removes it after
-the extension finishes or is stopped. Normalized exports exclude cookies,
-request headers, CSRF tokens, session IDs, and raw response envelopes. Saved
+the extension finishes or is stopped. Exports exclude cookies, request headers,
+CSRF tokens, and session IDs. The optional raw-pages export contains response
+envelopes but not captured authentication material. Saved
 collections are private personal data, so review exported files before sharing
 them.
 
