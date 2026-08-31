@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "InstaCinema Browser Collector",
-  "description": "Capture selected Instagram collection responses from a user-selected tab for local InstaCinema development.",
-  "version": "0.1.0",
+  "description": "Export Instagram saved collections as normalized JSON or CSV files.",
+  "version": "0.2.0",
   "permissions": [
     "activeTab",
     "alarms",
@@ -14,7 +14,9 @@
   ],
   "host_permissions": [
     "https://*.instagram.com/*",
-    "https://i.instagram.com/*",
+    "https://i.instagram.com/*"
+  ],
+  "optional_host_permissions": [
     "http://127.0.0.1:8000/*"
   ],
   "background": {
@@ -23,12 +25,17 @@
   },
   "action": {
     "default_title": "InstaCinema Collector",
+    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon.png",
       "32": "icons/icon.png",
       "48": "icons/icon.png",
       "128": "icons/icon.png"
     }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "commands": {
     "_execute_action": {

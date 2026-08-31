@@ -1,0 +1,9 @@
+{
+  "name": "instacinema-browser-collector",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node --check service_worker.js && node --check popup.js && node --check options.js"
+  }
+}

@@ -1,6 +1,7 @@
 # Local captures and diagnostics
 *.json
 !manifest.json
+!package.json
 
 # OS/editor files
 .DS_Store

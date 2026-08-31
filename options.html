@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>InstaCinema advanced settings</title>
+    <link rel="stylesheet" href="ui.css">
+  </head>
+  <body class="options">
+    <main>
+      <h1>Advanced settings</h1>
+      <p class="intro">Local exports do not require a server. Enable ingestion only when you run a compatible API on your computer.</p>
+      <section class="panel">
+        <label class="toggle-row">
+          <span><strong>Upload raw pages to local API</strong><small>Send captures to http://127.0.0.1:8000 for background processing.</small></span>
+          <input id="ingestion" type="checkbox">
+        </label>
+        <p id="permission-status" class="muted"></p>
+      </section>
+      <section class="panel">
+        <strong>Pending uploads</strong>
+        <p><span id="pending-count">0</span> requests are stored locally.</p>
+        <button id="clear-outbox" class="secondary">Clear pending uploads</button>
+      </section>
+      <p id="save-status" class="success" aria-live="polite"></p>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

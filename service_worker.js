@@ -1,3 +1,11 @@
+import {normalizeCapture, normalizedCollectionToCsv} from "./normalizer.js";
+import {
+  DEFAULT_SETTINGS,
+  LOCAL_BACKEND_PERMISSION,
+  OUTBOX_STORAGE_KEY,
+  SETTINGS_STORAGE_KEY,
+} from "./settings.js";
+
 const LOCAL_BACKEND = "http://127.0.0.1:8000";
 
 // Capture Instagram's current saved-collection GraphQL response and retain the
@@ -51,10 +59,23 @@ const SCROLL_LOAD_TIMEOUT_MS = 10000;
 const CAPTURE_STORAGE_KEY = "capturedResponses";
 const LOG_STORAGE_KEY = "collectorLog";
 const LAST_RUN_STORAGE_KEY = "lastRunSummary";
-const OUTBOX_STORAGE_KEY = "ingestionOutbox";
 const OUTBOX_ALARM = "instacinema-outbox-retry";
 const MAX_OUTBOX_CONCURRENCY = 3;
 const BACKEND_REQUEST_TIMEOUT_MS = 15000;
+let currentStatusMessage = "Open a saved collection to begin.";
+
+async function userSettings() {
+  const stored = await chrome.storage.local.get({
+    [SETTINGS_STORAGE_KEY]: DEFAULT_SETTINGS,
+  });
+  return {...DEFAULT_SETTINGS, ...stored[SETTINGS_STORAGE_KEY]};
+}
+
+async function ingestionIsEnabled() {
+  const settings = await userSettings();
+  if (!settings.ingestion_enabled) return false;
+  return chrome.permissions.contains({origins: [LOCAL_BACKEND_PERMISSION]});
+}
 
 function pageKey(url, postData = "", body = null) {
   const parsed = new URL(url);
@@ -136,6 +157,7 @@ function pageDetails(body) {
 }
 
 function sendStatus(message) {
+  currentStatusMessage = message;
   const progress = SCROLL_ONLY_MODE
     ? `Scroll steps: ${scrollStepCount}`
     : `Items fetched: ${capturedPostIds.size}`;
@@ -431,10 +453,11 @@ async function updateOutboxBadge() {
     ? capturedPostIds.size
     : capturedItemCount(stored[CAPTURE_STORAGE_KEY]);
   const failed = outbox.filter((item) => item.permanent_error).length;
-  if (failed) {
+  const ingestionEnabled = await ingestionIsEnabled();
+  if (ingestionEnabled && failed) {
     await chrome.action.setBadgeBackgroundColor({color: "#b42318"});
     await chrome.action.setBadgeText({text: "!"});
-  } else if (outbox.length) {
+  } else if (ingestionEnabled && outbox.length) {
     await chrome.action.setBadgeBackgroundColor({color: "#6941c6"});
     await chrome.action.setBadgeText({
       text: itemCount ? formatBadgeItemCount(itemCount) : "↑",
@@ -458,6 +481,10 @@ function scheduleOutboxPump() {
 
 async function processOutbox() {
   if (outboxPumpRunning) return;
+  if (!await ingestionIsEnabled()) {
+    await updateOutboxBadge();
+    return;
+  }
   outboxPumpRunning = true;
   try {
     const stored = await chrome.storage.local.get({[OUTBOX_STORAGE_KEY]: []});
@@ -498,6 +525,7 @@ async function processOutbox() {
 }
 
 async function queueRunStart() {
+  if (!await ingestionIsEnabled()) return;
   await addOutboxItem({
     id: `${currentRunId}:start`,
     type: "start",
@@ -514,6 +542,7 @@ async function queueRunStart() {
 }
 
 async function queuePageUpload(page) {
+  if (!await ingestionIsEnabled()) return;
   await addOutboxItem({
     id: `${page.run_id}:page:${page.page_index}`,
     type: "page",
@@ -530,6 +559,7 @@ async function queuePageUpload(page) {
 }
 
 async function queueRunFinish(summary) {
+  if (!await ingestionIsEnabled()) return;
   await addOutboxItem({
     id: `${summary.run_id}:finish`,
     type: "finish",
@@ -1039,6 +1069,10 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 });
 
 async function start(tab) {
+  const settings = await userSettings();
+  if (!settings.export_json && !settings.export_csv) {
+    return {message: "Select at least one export format first.", running: false};
+  }
   if (!tab?.id || !tab.url?.includes("instagram.com")) {
     return {message: "Open Instagram in the active tab first.", running: false};
   }
@@ -1115,7 +1149,7 @@ async function start(tab) {
     await stop("initial_collection_response_timeout");
     return {message: "Initial collection response timed out.", running: false};
   }
-  sendStatus("Initial page recorded locally; backend upload queued.");
+  sendStatus("Initial page recorded locally.");
   await setPageOverlay("Collecting posts…", true);
   requestScroll();
   return {message: "Started.", running: true};
@@ -1194,7 +1228,7 @@ async function requestScroll() {
       await stop("collection_response_timeout_after_scroll");
       return;
     }
-    sendStatus(`Page ${processedPageCount} recorded locally; backend upload queued.`);
+    sendStatus(`Page ${processedPageCount} recorded locally.`);
   } catch (error) {
     console.warn("Collection page loop failed", error);
     sendStatus(`Collection failed: ${error.message}`);
@@ -1222,6 +1256,8 @@ async function stop(reason = "stopped_by_user", details = {}) {
   const summary = {
     run_id: currentRunId,
     collection_name: currentCollectionName,
+    collection_pk: currentCollectionPk,
+    started_at: currentStartedAt,
     reason,
     details,
     pages_recorded: processedPageCount,
@@ -1275,27 +1311,26 @@ async function stop(reason = "stopped_by_user", details = {}) {
   }
   await queueRunFinish(summary);
   processedPageCount = 0;
+  const ingestionEnabled = await ingestionIsEnabled();
   const message = SCROLL_ONLY_MODE
     ? "Scrolling stopped. No responses were captured."
-    : `Capture finished locally (${summary.unique_items} items); cloud uploads continue in the background.`;
+    : ingestionEnabled
+      ? `Exported ${summary.unique_items} items; local API uploads continue in the background.`
+      : `Exported ${summary.unique_items} items to Downloads.`;
   sendStatus(message);
   return {message, running: false};
 }
-
-chrome.action.onClicked.addListener(async (tab) => {
-  if (running) {
-    await stop("stopped_by_user");
-  } else {
-    await start(tab);
-  }
-});
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === OUTBOX_ALARM) scheduleOutboxPump();
 });
 
-chrome.runtime.onStartup.addListener(scheduleOutboxPump);
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onStartup.addListener(() => scheduleOutboxPump());
+chrome.runtime.onInstalled.addListener(async () => {
+  const stored = await chrome.storage.local.get(SETTINGS_STORAGE_KEY);
+  if (!stored[SETTINGS_STORAGE_KEY]) {
+    await chrome.storage.local.set({[SETTINGS_STORAGE_KEY]: DEFAULT_SETTINGS});
+  }
   chrome.alarms.create(OUTBOX_ALARM, {periodInMinutes: 1});
   scheduleOutboxPump();
 });
@@ -1306,31 +1341,61 @@ scheduleOutboxPump();
 async function exportCaptures(summary = null) {
   const stored = await chrome.storage.local.get({[CAPTURE_STORAGE_KEY]: []});
   const pages = stored[CAPTURE_STORAGE_KEY];
-  const snapshot = {
-    run_id: summary?.run_id || currentRunId,
-    platform: "instagram",
-    collector: "instagram-extension",
-    collection_name: currentCollectionName,
-    collection_pk: String(currentCollectionPk
-      || pages.find((page) => page.collection_id)?.collection_id
-      || ""),
-    capture_status: summary?.capture_status || "running",
-    page_count: pages.length,
-    pages,
-  };
-  const data = JSON.stringify(snapshot, null, 2);
-  const url = `data:application/json;charset=utf-8,${encodeURIComponent(data)}`;
-  const safeName = currentCollectionName.replace(/[^a-z0-9 _-]/gi, "_").trim() || "Collection";
-  const timestamp = formatLocalTimestamp().replace(/:/g, "-");
-  await chrome.downloads.download({
-    url,
-    filename: `Instagram - ${safeName} (${timestamp}).json`,
-    saveAs: false,
+  const settings = await userSettings();
+  if (!settings.export_json && !settings.export_csv) {
+    throw new Error("Select at least one export format.");
+  }
+  const normalized = normalizeCapture(pages, {
+    ...summary,
+    collection_name: summary?.collection_name || currentCollectionName,
+    collection_pk: summary?.collection_pk || currentCollectionPk,
   });
-  return {message: `Exported ${pages.length} captured pages.`};
+  const safeName = normalized.collection.name.replace(/[^a-z0-9 _-]/gi, "_").trim()
+    || "Collection";
+  const timestamp = formatLocalTimestamp().replace(/:/g, "-");
+  const basename = `Instagram - ${safeName} (${timestamp})`;
+  const downloads = [];
+  if (settings.export_json) {
+    downloads.push(chrome.downloads.download({
+      url: `data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(normalized, null, 2))}`,
+      filename: `${basename}.json`,
+      saveAs: false,
+    }));
+  }
+  if (settings.export_csv) {
+    downloads.push(chrome.downloads.download({
+      url: `data:text/csv;charset=utf-8,${encodeURIComponent(normalizedCollectionToCsv(normalized))}`,
+      filename: `${basename}.csv`,
+      saveAs: false,
+    }));
+  }
+  await Promise.all(downloads);
+  return {
+    message: `Exported ${normalized.items.length} items as ${[
+      settings.export_json && "JSON",
+      settings.export_csv && "CSV",
+    ].filter(Boolean).join(" and ")}.`,
+  };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "get-state") {
+    sendResponse({
+      running,
+      item_count: running ? capturedPostIds.size : 0,
+      message: currentStatusMessage,
+    });
+    return false;
+  }
+  if (message.type === "settings-updated") {
+    scheduleOutboxPump();
+    updateOutboxBadge().then(() => sendResponse({ok: true}));
+    return true;
+  }
+  if (message.type === "outbox-cleared") {
+    updateOutboxBadge().then(() => sendResponse({ok: true}));
+    return true;
+  }
   if (message.type === "start") {
     chrome.tabs.query({active: true, currentWindow: true}).then(([tab]) => start(tab))
       .then(sendResponse);

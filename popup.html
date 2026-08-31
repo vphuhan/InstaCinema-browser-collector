@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>InstaCinema Collector</title>
+    <link rel="stylesheet" href="ui.css">
+  </head>
+  <body class="popup">
+    <header>
+      <img src="icons/icon.svg" alt="">
+      <div><h1>Collection exporter</h1><p>Instagram saved collections</p></div>
+    </header>
+    <main>
+      <section class="status-card" aria-live="polite">
+        <span id="status-dot" class="status-dot"></span>
+        <div><strong id="status-title">Ready</strong><p id="status">Open a saved collection to begin.</p></div>
+      </section>
+      <fieldset id="formats">
+        <legend>Export formats</legend>
+        <label><input id="format-json" type="checkbox"> Normalized JSON</label>
+        <label><input id="format-csv" type="checkbox"> CSV table</label>
+        <p id="format-error" class="error" hidden>Select at least one format.</p>
+      </fieldset>
+      <div class="actions">
+        <button id="start" class="primary">Start capture</button>
+        <button id="stop" class="danger" hidden>Stop and export</button>
+      </div>
+      <button id="advanced" class="link-button">Advanced settings</button>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
