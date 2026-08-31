@@ -864,6 +864,9 @@ async function storeCapture(payload, pageIndex) {
   };
   captures.push(page);
   await chrome.storage.local.set({[CAPTURE_STORAGE_KEY]: captures});
+  // Badge progress belongs to capture, not backend ingestion. Refresh it even
+  // when the optional local API outbox is disabled.
+  await updateOutboxBadge();
   await queuePageUpload(page);
 }
 
