@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "InstaCinema Browser Collector",
+  "name": "StashTable",
   "description": "Export Instagram saved collections as normalized JSON or CSV files.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "permissions": [
     "activeTab",
     "alarms",
@@ -24,7 +24,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "InstaCinema Collector",
+    "default_title": "StashTable",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon.png",
@@ -43,7 +43,7 @@
         "default": "Ctrl+Shift+8",
         "mac": "Command+Shift+8"
       },
-      "description": "Start or stop InstaCinema collection capture"
+      "description": "Open StashTable collection capture"
     }
   },
   "icons": {

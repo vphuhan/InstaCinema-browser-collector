@@ -197,7 +197,7 @@ async function runScrollOnlyPageOperation(operation, payload = {}) {
           overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:wait;background:rgba(0,0,0,.38);pointer-events:none;';
           document.documentElement.appendChild(overlay);
         }
-        overlay.innerHTML = '<div style="position:fixed;left:18px;bottom:18px;padding:10px 14px;border-radius:10px;color:#fff;background:rgba(24,20,38,.94);font:13px system-ui,sans-serif;">🎬 InstaCinema<br><span></span></div>';
+        overlay.innerHTML = '<div style="position:fixed;left:18px;bottom:18px;padding:10px 14px;border-radius:10px;color:#fff;background:rgba(24,20,38,.94);font:13px system-ui,sans-serif;">📚 StashTable<br><span></span></div>';
         overlay.querySelector('span').textContent = String(data.message);
         return null;
       }
@@ -314,7 +314,7 @@ function appendLog(event, details = {}) {
     event,
     ...details,
   };
-  console.info("InstaCinema run log", entry);
+  console.info("StashTable run log", entry);
   logWriteChain = logWriteChain.catch(() => {}).then(async () => {
     const stored = await chrome.storage.local.get({[LOG_STORAGE_KEY]: []});
     stored[LOG_STORAGE_KEY].push(entry);
@@ -475,7 +475,7 @@ async function updateOutboxBadge() {
 
 function scheduleOutboxPump() {
   setTimeout(() => processOutbox().catch((error) => {
-    console.warn("InstaCinema outbox pump failed", error);
+    console.warn("StashTable outbox pump failed", error);
   }), 0);
 }
 
@@ -511,7 +511,7 @@ async function processOutbox() {
         }
       }).catch(async (error) => {
         await recordOutboxFailure(item.id, error);
-        console.warn("InstaCinema outbox upload failed", item.id, error);
+        console.warn("StashTable outbox upload failed", item.id, error);
       }).finally(async () => {
         activeOutboxRequests.delete(item.id);
         await updateOutboxBadge();
@@ -594,7 +594,7 @@ async function setPageOverlay(message, visible) {
         overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:wait;background:rgba(0,0,0,.38);pointer-events:none;';
         document.documentElement.appendChild(overlay);
       }
-      overlay.innerHTML = '<div style="position:fixed;left:18px;bottom:18px;padding:10px 14px;border-radius:10px;color:#fff;background:rgba(24,20,38,.94);font:13px system-ui,sans-serif;">🎬 InstaCinema<br><span></span></div>';
+      overlay.innerHTML = '<div style="position:fixed;left:18px;bottom:18px;padding:10px 14px;border-radius:10px;color:#fff;background:rgba(24,20,38,.94);font:13px system-ui,sans-serif;">📚 StashTable<br><span></span></div>';
       overlay.querySelector('span').textContent = ${encodedMessage};
     })()`,
   });
@@ -899,7 +899,7 @@ async function captureResponseBody(requestId, metadata) {
         morePagesAvailable = Boolean(page.moreAvailable);
       }
       nextMaxId = page.moreAvailable && page.nextCursor ? page.nextCursor : null;
-      console.info("InstaCinema collection page", {
+      console.info("StashTable collection page", {
         url: metadata.url,
         itemCount: page.items.length,
         moreAvailable: page.moreAvailable,
@@ -1025,7 +1025,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     } catch {
       parsedUrl = null;
     }
-    console.info("InstaCinema network discovery", {
+    console.info("StashTable network discovery", {
       type: params.type,
       url: response.url,
       pathname: parsedUrl?.pathname,
@@ -1202,7 +1202,7 @@ async function requestScroll() {
   scrollInFlight = true;
   try {
     if (morePagesAvailable === false) {
-      console.info("InstaCinema stopping: Instagram reported no more collection pages");
+      console.info("StashTable stopping: Instagram reported no more collection pages");
       sendStatus("Instagram reported no more pages; finishing capture.");
       await stop("instagram_no_more_pages");
       return;
@@ -1217,7 +1217,7 @@ async function requestScroll() {
       before,
       ...bottomScroll,
     });
-    console.info("InstaCinema scrolled to current bottom", {
+    console.info("StashTable scrolled to current bottom", {
       processedPageCount,
       matchingResponseCount,
     });
@@ -1267,7 +1267,7 @@ async function stop(reason = "stopped_by_user", details = {}) {
   };
   await appendLog("run_stopping", summary);
   await chrome.storage.local.set({[LAST_RUN_STORAGE_KEY]: summary});
-  console.info("InstaCinema stopped", summary);
+  console.info("StashTable stopped", summary);
   clearInterval(scrollTimer);
   clearTimeout(scrollTimer);
   scrollTimer = null;

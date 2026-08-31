@@ -1,4 +1,6 @@
-# InstaCinema Browser Collector
+# StashTable
+
+**Turn saved collections into useful data.**
 
 Export the posts in an Instagram saved collection as a clean JSON file or CSV
 table. The extension uses your existing Instagram browser session: it never
@@ -13,7 +15,7 @@ package installation is required.
 2. Open `chrome://extensions` in Chrome or `brave://extensions` in Brave.
 3. Enable **Developer mode**.
 4. Click **Load unpacked** and select this repository's folder.
-5. Pin **InstaCinema Browser Collector** to the toolbar.
+5. Pin **StashTable** to the toolbar.
 
 ## Export a collection
 
