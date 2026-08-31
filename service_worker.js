@@ -1,11 +1,14 @@
-const LOCAL_BACKEND = "http://127.0.0.1:8000/browser-capture";
+const LOCAL_BACKEND = "http://127.0.0.1:8000";
 
-// Found in the installed aiograpi collection implementation.
-const KNOWN_ENDPOINT_PATTERNS = [
-  "/api/v1/collections/list/",
-  "/api/v1/feed/collection/",
-  "/api/v1/feed/saved/posts/",
-];
+// Capture Instagram's current saved-collection GraphQL response and retain the
+// legacy collection /posts/ endpoint as a fallback. /all/ is ignored.
+const COLLECTION_POSTS_ENDPOINT = /^\/api\/v1\/feed\/collection\/\d+\/posts\/$/;
+const COLLECTION_GRAPHQL_ENDPOINT = "/api/graphql";
+// Normal collector mode captures response bodies, forwards them to the local
+// API when available, and exports the completed collection to Downloads.
+const SCROLL_ONLY_MODE = false;
+// Set to false to rely on Instagram's normal infinite-scroll loading.
+const USE_CURSOR_REQUESTS = false;
 
 // Add browser-specific patterns here after confirming them in DevTools.
 const PLACEHOLDER_ENDPOINT_PATTERNS = [
@@ -15,41 +18,128 @@ const PLACEHOLDER_ENDPOINT_PATTERNS = [
 // Keep this enabled while discovering the browser's actual endpoint names.
 // Metadata is logged locally; response bodies are still captured only for
 // matching patterns above.
-const DISCOVERY_MODE = true;
+const DISCOVERY_MODE = false;
 
 let activeTabId = null;
 let running = false;
 let scrollTimer = null;
 let scrollInFlight = false;
+let scrollStepCount = 0;
 let matchingResponseCount = 0;
-let noResponseAttempts = 0;
+let processedPageCount = 0;
 let morePagesAvailable = null;
 let cursorRequestFailures = 0;
 let currentCollectionName = "Collection";
-let localBackendUnavailable = false;
+let currentCollectionPk = null;
+let currentRunId = null;
+let currentStartedAt = null;
 const pendingResponseBodies = new Map();
 const captureTasks = new Set();
 const requestedPageUrls = new Set();
 const requestHeadersById = new Map();
+const targetRequestsById = new Map();
 const capturedPageKeys = new Set();
 const capturedPostIds = new Set();
-const RESPONSE_WAIT_MS = 900;
-const MAX_NO_RESPONSE_ATTEMPTS = 8;
+let logWriteChain = Promise.resolve();
+let outboxWriteChain = Promise.resolve();
+let outboxPumpRunning = false;
+const activeOutboxRequests = new Set();
+const PAGE_RESPONSE_TIMEOUT_MS = 15000;
+const LOADING_INDICATOR_WAIT_MS = 2500;
+const INITIAL_LOADING_INDICATOR_WAIT_MS = 20000;
+const SCROLL_LOAD_TIMEOUT_MS = 10000;
 const CAPTURE_STORAGE_KEY = "capturedResponses";
 const LOG_STORAGE_KEY = "collectorLog";
+const LAST_RUN_STORAGE_KEY = "lastRunSummary";
+const OUTBOX_STORAGE_KEY = "ingestionOutbox";
+const OUTBOX_ALARM = "instacinema-outbox-retry";
+const MAX_OUTBOX_CONCURRENCY = 3;
+const BACKEND_REQUEST_TIMEOUT_MS = 15000;
 
-function pageKey(url) {
+function pageKey(url, postData = "", body = null) {
   const parsed = new URL(url);
+  if (isGraphQLUrl(url)) {
+    if (postData) {
+      const form = new URLSearchParams(postData);
+      return `${parsed.origin}${parsed.pathname}?doc_id=${form.get("doc_id") || ""}`
+        + `&variables=${form.get("variables") || ""}`;
+    }
+    const collection = graphQLCollection(body);
+    const details = pageDetails(body);
+    const firstItemId = details.items[0]?.pk || details.items[0]?.id || "empty";
+    return `${parsed.origin}${parsed.pathname}?collection_id=${collection?.id || ""}`
+      + `&end_cursor=${details.nextCursor || ""}&first_item=${firstItemId}`;
+  }
   return `${parsed.origin}${parsed.pathname}?${parsed.searchParams.toString()}`;
 }
 
 function endpointMatches(url) {
-  return [...KNOWN_ENDPOINT_PATTERNS, ...PLACEHOLDER_ENDPOINT_PATTERNS]
-    .some((pattern) => url.includes(pattern));
+  try {
+    const pathname = new URL(url).pathname;
+    return COLLECTION_POSTS_ENDPOINT.test(pathname)
+      || PLACEHOLDER_ENDPOINT_PATTERNS.some((pattern) => url.includes(pattern));
+  } catch {
+    return false;
+  }
+}
+
+function isGraphQLUrl(url) {
+  try {
+    return new URL(url).pathname.replace(/\/$/, "") === COLLECTION_GRAPHQL_ENDPOINT;
+  } catch {
+    return false;
+  }
+}
+
+function requestMatches(request) {
+  if (endpointMatches(request?.url || "")) return true;
+  // Chrome/Brave does not consistently expose x-fb-friendly-name or POST data
+  // in requestWillBeSent. Observe GraphQL responses, then reject unrelated
+  // bodies after decoding them.
+  return isGraphQLUrl(request?.url || "");
+}
+
+function findGraphQLConnection(value) {
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value.edges) && value.page_info && typeof value.page_info === "object") {
+    return value;
+  }
+  for (const child of Object.values(value)) {
+    const connection = findGraphQLConnection(child);
+    if (connection) return connection;
+  }
+  return null;
+}
+
+function graphQLCollection(body) {
+  const collection = body?.data?.fetch__MediaCollection;
+  return collection && typeof collection === "object" ? collection : null;
+}
+
+function pageDetails(body) {
+  const legacyPage = body?.save_media_response || body;
+  if (Array.isArray(legacyPage?.items)) {
+    return {
+      items: legacyPage.items,
+      moreAvailable: legacyPage.more_available,
+      nextCursor: legacyPage.next_max_id || null,
+    };
+  }
+  const collection = graphQLCollection(body);
+  const connection = collection?.media || findGraphQLConnection(body);
+  if (!connection) return {items: [], moreAvailable: undefined, nextCursor: null};
+  return {
+    items: connection.edges.map((edge) => edge?.node?.media || edge?.node).filter(Boolean),
+    moreAvailable: connection.page_info.has_next_page,
+    nextCursor: connection.page_info.end_cursor || null,
+  };
 }
 
 function sendStatus(message) {
-  const displayMessage = `${message} · Items fetched: ${capturedPostIds.size}`;
+  const progress = SCROLL_ONLY_MODE
+    ? `Scroll steps: ${scrollStepCount}`
+    : `Items fetched: ${capturedPostIds.size}`;
+  const displayMessage = `${message} · ${progress}`;
   chrome.runtime.sendMessage({type: "status", message: displayMessage}).catch(() => {});
   appendLog("status", {message});
   if (activeTabId !== null && running) {
@@ -59,10 +149,90 @@ function sendStatus(message) {
   }
 }
 
+async function runScrollOnlyPageOperation(operation, payload = {}) {
+  const results = await chrome.scripting.executeScript({
+    target: {tabId: activeTabId},
+    func: (name, data) => {
+      const loadingSelector = '[data-visualcompletion="loading-state"][role="progressbar"]';
+      const visibleLoadingIndicators = () => [...document.querySelectorAll(loadingSelector)]
+        .map((element) => ({element, box: element.getBoundingClientRect()}))
+        .filter(({element, box}) => {
+          const style = getComputedStyle(element);
+          return style.display !== 'none' && style.visibility !== 'hidden'
+            && box.width > 0 && box.height > 0;
+        });
+
+      if (name === "set-overlay") {
+        const id = '__instacinema_collector_overlay__';
+        let overlay = document.getElementById(id);
+        if (!data.visible) {
+          overlay?.remove();
+          return null;
+        }
+        if (!overlay) {
+          overlay = document.createElement('div');
+          overlay.id = id;
+          overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:wait;background:rgba(0,0,0,.38);pointer-events:none;';
+          document.documentElement.appendChild(overlay);
+        }
+        overlay.innerHTML = '<div style="position:fixed;left:18px;bottom:18px;padding:10px 14px;border-radius:10px;color:#fff;background:rgba(24,20,38,.94);font:13px system-ui,sans-serif;">🎬 InstaCinema<br><span></span></div>';
+        overlay.querySelector('span').textContent = String(data.message);
+        return null;
+      }
+
+      const root = document.scrollingElement || document.documentElement;
+      if (name === "metrics") {
+        const height = Math.max(root.scrollHeight, document.body?.scrollHeight || 0);
+        const viewport = window.innerHeight;
+        const scrollY = window.scrollY || root.scrollTop || 0;
+        return {
+          scrollY,
+          height,
+          viewport,
+          atBottom: scrollY + viewport >= height - 4,
+          loading: visibleLoadingIndicators().length > 0,
+          itemCount: document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]').length,
+        };
+      }
+
+      if (name === "scroll-to-loading-indicator") {
+        const candidates = visibleLoadingIndicators()
+          .sort((left, right) => right.box.bottom - left.box.bottom);
+        if (!candidates.length) return null;
+        const {box} = candidates[0];
+        const beforeY = window.scrollY || root.scrollTop || 0;
+        const maxY = Math.max(0, root.scrollHeight - window.innerHeight);
+        const targetY = Math.min(maxY, Math.max(0, beforeY + box.bottom - window.innerHeight + 24));
+        window.scrollTo({top: targetY, behavior: 'auto'});
+        return {
+          beforeY,
+          targetY,
+          indicatorTop: beforeY + box.top,
+          indicatorBottom: beforeY + box.bottom,
+          candidateCount: candidates.length,
+        };
+      }
+
+      if (name === "scroll-to-current-bottom") {
+        const beforeY = window.scrollY || root.scrollTop || 0;
+        const targetY = Math.max(0, root.scrollHeight - window.innerHeight);
+        window.scrollTo({top: targetY, behavior: 'auto'});
+        return {beforeY, targetY, height: root.scrollHeight};
+      }
+
+      throw new Error(`Unknown scroll-only page operation: ${name}`);
+    },
+    args: [operation, payload],
+  });
+  return results?.[0]?.result ?? null;
+}
+
 function countPageItems(body) {
-  const page = body?.save_media_response || body;
-  if (page?.collection_name) currentCollectionName = page.collection_name;
-  for (const item of page?.items || []) {
+  const legacyPage = body?.save_media_response || body;
+  const graphqlName = graphQLCollection(body)?.name;
+  if (graphqlName) currentCollectionName = graphqlName;
+  else if (legacyPage?.collection_name) currentCollectionName = legacyPage.collection_name;
+  for (const item of pageDetails(body).items) {
     const media = item?.media || item;
     const id = media?.pk || media?.id;
     if (id !== undefined && id !== null) capturedPostIds.add(String(id));
@@ -90,14 +260,296 @@ function collectionNameFromUrl(url) {
   return "Collection";
 }
 
-async function appendLog(event, details = {}) {
-  const stored = await chrome.storage.local.get({[LOG_STORAGE_KEY]: []});
-  stored[LOG_STORAGE_KEY].push({timestamp: new Date().toISOString(), event, ...details});
-  await chrome.storage.local.set({[LOG_STORAGE_KEY]: stored[LOG_STORAGE_KEY]});
+function collectionIdFromUrl(url) {
+  const match = String(url).match(/\/feed\/collection\/(\d+)/);
+  return match?.[1] || null;
+}
+
+function collectionIdFromSavedUrl(url) {
+  return String(url).match(/\/saved\/[^/]+\/(\d+)\/?/)?.[1] || null;
+}
+
+function collectionIdFromPostData(postData = "") {
+  try {
+    const variables = JSON.parse(new URLSearchParams(postData).get("variables") || "{}");
+    return variables.collection_id ? String(variables.collection_id) : null;
+  } catch {
+    return null;
+  }
+}
+
+function collectionIdFromHeaders(headers = {}) {
+  const referer = Object.entries(headers).find(
+    ([name]) => name.toLowerCase() === "referer",
+  )?.[1] || "";
+  return String(referer).match(/\/saved\/[^/]+\/(\d+)\//)?.[1] || null;
+}
+
+function appendLog(event, details = {}) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    run_id: currentRunId,
+    event,
+    ...details,
+  };
+  console.info("InstaCinema run log", entry);
+  logWriteChain = logWriteChain.catch(() => {}).then(async () => {
+    const stored = await chrome.storage.local.get({[LOG_STORAGE_KEY]: []});
+    stored[LOG_STORAGE_KEY].push(entry);
+    await chrome.storage.local.set({[LOG_STORAGE_KEY]: stored[LOG_STORAGE_KEY]});
+  });
+  return logWriteChain;
+}
+
+function withOutbox(mutator) {
+  outboxWriteChain = outboxWriteChain.catch(() => {}).then(async () => {
+    const stored = await chrome.storage.local.get({[OUTBOX_STORAGE_KEY]: []});
+    const outbox = stored[OUTBOX_STORAGE_KEY];
+    const result = await mutator(outbox);
+    await chrome.storage.local.set({[OUTBOX_STORAGE_KEY]: outbox});
+    return result;
+  });
+  return outboxWriteChain;
+}
+
+async function addOutboxItem(item) {
+  await withOutbox((outbox) => {
+    if (!outbox.some((candidate) => candidate.id === item.id)) {
+      outbox.push({...item, attempts: 0, next_attempt_at: 0});
+    }
+  });
+  scheduleOutboxPump();
+}
+
+async function removeOutboxItem(itemId) {
+  await withOutbox((outbox) => {
+    const index = outbox.findIndex((item) => item.id === itemId);
+    if (index >= 0) outbox.splice(index, 1);
+  });
+}
+
+async function recordOutboxFailure(itemId, error) {
+  await withOutbox((outbox) => {
+    const item = outbox.find((candidate) => candidate.id === itemId);
+    if (!item) return;
+    item.attempts += 1;
+    item.last_error = error.message;
+    item.permanent_error = Boolean(
+      error.status && error.status >= 400 && error.status < 500 && error.status !== 404,
+    );
+    const backoffSeconds = Math.min(2 ** Math.min(item.attempts, 6), 60);
+    item.next_attempt_at = Date.now() + backoffSeconds * 1000;
+  });
+}
+
+async function backendRequest(path, options) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), BACKEND_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${LOCAL_BACKEND}${path}`, {
+      ...options,
+      headers: {"Content-Type": "application/json", ...(options.headers || {})},
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      const error = new Error(`Backend HTTP ${response.status}: ${detail.slice(0, 300)}`);
+      error.status = response.status;
+      throw error;
+    }
+    return response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function uploadOutboxItem(item) {
+  if (item.type === "start") {
+    return backendRequest("/api/v1/ingestion/runs", {
+      method: "POST",
+      body: JSON.stringify(item.payload),
+    });
+  }
+  if (item.type === "page") {
+    return backendRequest(
+      `/api/v1/ingestion/runs/${item.run_id}/pages/${item.page_index}`,
+      {method: "PUT", body: JSON.stringify(item.payload)},
+    );
+  }
+  if (item.type === "finish") {
+    return backendRequest(`/api/v1/ingestion/runs/${item.run_id}/finish`, {
+      method: "POST",
+      body: JSON.stringify(item.payload),
+    });
+  }
+  throw new Error(`Unknown outbox item type: ${item.type}`);
+}
+
+function outboxItemIsEligible(item, outbox) {
+  if (item.permanent_error || item.next_attempt_at > Date.now()) return false;
+  if (activeOutboxRequests.has(item.id)) return false;
+  if (item.type === "start") return true;
+  if (outbox.some((candidate) => (
+    candidate.run_id === item.run_id && candidate.type === "start"
+  ))) return false;
+  if (item.type === "finish" && outbox.some((candidate) => (
+    candidate.run_id === item.run_id && candidate.type === "page"
+  ))) return false;
+  return true;
+}
+
+function formatBadgeItemCount(count) {
+  if (count < 1000) return String(count);
+  if (count < 10000) return `${Math.floor(count / 100) / 10}K`;
+  if (count < 1000000) return `${Math.floor(count / 1000)}K`;
+  if (count < 10000000) return `${Math.floor(count / 100000) / 10}M`;
+  if (count < 100000000) return `${Math.floor(count / 1000000)}M`;
+  return "99M+";
+}
+
+function capturedItemCount(captures) {
+  const itemKeys = new Set();
+  for (const [pageIndex, capture] of captures.entries()) {
+    for (const [itemIndex, item] of pageDetails(capture?.body).items.entries()) {
+      const media = item?.media || item;
+      const id = media?.pk || media?.id;
+      itemKeys.add(id === undefined || id === null
+        ? `${pageIndex}:${itemIndex}`
+        : String(id));
+    }
+  }
+  return itemKeys.size;
+}
+
+async function updateOutboxBadge() {
+  const stored = await chrome.storage.local.get({
+    [OUTBOX_STORAGE_KEY]: [],
+    [CAPTURE_STORAGE_KEY]: [],
+  });
+  const outbox = stored[OUTBOX_STORAGE_KEY];
+  const itemCount = running
+    ? capturedPostIds.size
+    : capturedItemCount(stored[CAPTURE_STORAGE_KEY]);
+  const failed = outbox.filter((item) => item.permanent_error).length;
+  if (failed) {
+    await chrome.action.setBadgeBackgroundColor({color: "#b42318"});
+    await chrome.action.setBadgeText({text: "!"});
+  } else if (outbox.length) {
+    await chrome.action.setBadgeBackgroundColor({color: "#6941c6"});
+    await chrome.action.setBadgeText({
+      text: itemCount ? formatBadgeItemCount(itemCount) : "↑",
+    });
+  } else if (running) {
+    await chrome.action.setBadgeBackgroundColor({color: "#175cd3"});
+    await chrome.action.setBadgeText({
+      text: itemCount ? formatBadgeItemCount(itemCount) : "RUN",
+    });
+  } else {
+    await chrome.action.setBadgeBackgroundColor({color: "#667085"});
+    await chrome.action.setBadgeText({text: "OFF"});
+  }
+}
+
+function scheduleOutboxPump() {
+  setTimeout(() => processOutbox().catch((error) => {
+    console.warn("InstaCinema outbox pump failed", error);
+  }), 0);
+}
+
+async function processOutbox() {
+  if (outboxPumpRunning) return;
+  outboxPumpRunning = true;
+  try {
+    const stored = await chrome.storage.local.get({[OUTBOX_STORAGE_KEY]: []});
+    const outbox = stored[OUTBOX_STORAGE_KEY];
+    const capacity = MAX_OUTBOX_CONCURRENCY - activeOutboxRequests.size;
+    const eligible = outbox
+      .filter((item) => outboxItemIsEligible(item, outbox))
+      .slice(0, Math.max(0, capacity));
+    for (const item of eligible) {
+      activeOutboxRequests.add(item.id);
+      uploadOutboxItem(item).then(async (result) => {
+        await removeOutboxItem(item.id);
+        await appendLog("outbox_item_uploaded", {
+          outboxType: item.type,
+          outboxRunId: item.run_id,
+          pageIndex: item.page_index,
+          result,
+        });
+        if (item.type === "finish") {
+          chrome.runtime.sendMessage({
+            type: "status",
+            message: `Cloud save complete for ${item.run_id}.`,
+          }).catch(() => {});
+        }
+      }).catch(async (error) => {
+        await recordOutboxFailure(item.id, error);
+        console.warn("InstaCinema outbox upload failed", item.id, error);
+      }).finally(async () => {
+        activeOutboxRequests.delete(item.id);
+        await updateOutboxBadge();
+        scheduleOutboxPump();
+      });
+    }
+    await updateOutboxBadge();
+  } finally {
+    outboxPumpRunning = false;
+  }
+}
+
+async function queueRunStart() {
+  await addOutboxItem({
+    id: `${currentRunId}:start`,
+    type: "start",
+    run_id: currentRunId,
+    payload: {
+      run_id: currentRunId,
+      platform: "instagram",
+      collector: "instagram-extension",
+      collection_pk: currentCollectionPk,
+      collection_name: currentCollectionName,
+      started_at: currentStartedAt,
+    },
+  });
+}
+
+async function queuePageUpload(page) {
+  await addOutboxItem({
+    id: `${page.run_id}:page:${page.page_index}`,
+    type: "page",
+    run_id: page.run_id,
+    page_index: page.page_index,
+    payload: {
+      captured_at: page.captured_at,
+      request_url: page.request_url,
+      response_status: page.status,
+      mime_type: page.mime_type || "application/json",
+      body: page.body,
+    },
+  });
+}
+
+async function queueRunFinish(summary) {
+  await addOutboxItem({
+    id: `${summary.run_id}:finish`,
+    type: "finish",
+    run_id: summary.run_id,
+    payload: {
+      status: summary.capture_status,
+      page_count: summary.pages_recorded,
+      unique_item_count: summary.unique_items,
+      error_message: summary.capture_status === "failed" ? summary.reason : null,
+      finished_at: summary.finished_at,
+    },
+  });
 }
 
 async function setPageOverlay(message, visible) {
   if (activeTabId === null) return;
+  if (SCROLL_ONLY_MODE) {
+    await runScrollOnlyPageOperation("set-overlay", {message: String(message), visible});
+    return;
+  }
   const encodedMessage = JSON.stringify(String(message));
   await chrome.debugger.sendCommand({tabId: activeTabId}, "Runtime.evaluate", {
     expression: `(() => {
@@ -107,7 +559,9 @@ async function setPageOverlay(message, visible) {
       if (!overlay) {
         overlay = document.createElement('div');
         overlay.id = id;
-        overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:wait;background:rgba(0,0,0,.38);pointer-events:auto;';
+        // Keep the dim layer visible without intercepting the synthetic scroll
+        // gesture used to trigger Instagram's infinite-scroll loader.
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:wait;background:rgba(0,0,0,.38);pointer-events:none;';
         document.documentElement.appendChild(overlay);
       }
       overlay.innerHTML = '<div style="position:fixed;left:18px;bottom:18px;padding:10px 14px;border-radius:10px;color:#fff;background:rgba(24,20,38,.94);font:13px system-ui,sans-serif;">🎬 InstaCinema<br><span></span></div>';
@@ -117,6 +571,7 @@ async function setPageOverlay(message, visible) {
 }
 
 async function getPageMetrics() {
+  if (SCROLL_ONLY_MODE) return runScrollOnlyPageOperation("metrics");
   const result = await chrome.debugger.sendCommand(
     {tabId: activeTabId},
     "Runtime.evaluate",
@@ -126,12 +581,7 @@ async function getPageMetrics() {
         const height = Math.max(root.scrollHeight, document.body?.scrollHeight || 0);
         const viewport = window.innerHeight;
         const scrollY = window.scrollY || root.scrollTop || 0;
-        const loadingSelector = [
-          '[role="progressbar"]',
-          '[aria-label*="Loading" i]',
-          '[aria-label*="加载" i]',
-          '[data-testid*="loading" i]',
-        ].join(',');
+        const loadingSelector = '[data-visualcompletion="loading-state"][role="progressbar"]';
         const loading = [...document.querySelectorAll(loadingSelector)]
           .some((element) => {
             const style = getComputedStyle(element);
@@ -153,35 +603,150 @@ async function getPageMetrics() {
   return result?.result?.value || null;
 }
 
+async function reloadTabAndWaitForCompletion(timeoutMs = INITIAL_LOADING_INDICATOR_WAIT_MS) {
+  return new Promise((resolve) => {
+    let sawLoading = false;
+    let settled = false;
+    const finish = (completed) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve(completed);
+    };
+    const onUpdated = (tabId, changeInfo) => {
+      if (tabId !== activeTabId) return;
+      if (changeInfo.status === "loading") sawLoading = true;
+      if (sawLoading && changeInfo.status === "complete") finish(true);
+    };
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.reload(activeTabId).catch(() => finish(false));
+  });
+}
+
 async function scrollToLoadingIndicator() {
+  if (SCROLL_ONLY_MODE) {
+    return runScrollOnlyPageOperation("scroll-to-loading-indicator");
+  }
   const result = await chrome.debugger.sendCommand(
     {tabId: activeTabId},
     "Runtime.evaluate",
     {
       expression: `(() => {
-        const selector = [
-          '[role="progressbar"]',
-          '[aria-label*="Loading" i]',
-          '[aria-label*="加载" i]',
-          '[data-testid*="loading" i]',
-        ].join(',');
-        const element = [...document.querySelectorAll(selector)].find((candidate) => {
-          const style = getComputedStyle(candidate);
-          const box = candidate.getBoundingClientRect();
-          return style.display !== 'none' && style.visibility !== 'hidden'
-            && box.width > 0 && box.height > 0;
-        });
-        if (!element) return false;
-        element.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'auto'});
-        return true;
+        const selector = '[data-visualcompletion="loading-state"][role="progressbar"]';
+        const candidates = [...document.querySelectorAll(selector)]
+          .map((element) => ({element, box: element.getBoundingClientRect()}))
+          .filter(({element, box}) => {
+            const style = getComputedStyle(element);
+            return style.display !== 'none' && style.visibility !== 'hidden'
+              && box.width > 0 && box.height > 0;
+          })
+          .sort((left, right) => right.box.bottom - left.box.bottom);
+        if (!candidates.length) return null;
+        const {box} = candidates[0];
+        const root = document.scrollingElement || document.documentElement;
+        const beforeY = window.scrollY || root.scrollTop || 0;
+        const maxY = Math.max(0, root.scrollHeight - window.innerHeight);
+        const targetY = Math.min(maxY, Math.max(0, beforeY + box.bottom - window.innerHeight + 24));
+        window.scrollTo({top: targetY, behavior: 'auto'});
+        return {
+          beforeY,
+          targetY,
+          indicatorTop: beforeY + box.top,
+          indicatorBottom: beforeY + box.bottom,
+          candidateCount: candidates.length,
+        };
       })()`,
       returnByValue: true,
     },
   );
-  return result?.result?.value === true;
+  return result?.result?.value || null;
+}
+
+async function waitForLoadingIndicator(timeoutMs = LOADING_INDICATOR_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const indicator = await scrollToLoadingIndicator();
+    if (indicator) return indicator;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (running && Date.now() < deadline);
+  return false;
+}
+
+async function scrollToCurrentBottom() {
+  if (SCROLL_ONLY_MODE) {
+    return runScrollOnlyPageOperation("scroll-to-current-bottom");
+  }
+  const result = await chrome.debugger.sendCommand(
+    {tabId: activeTabId},
+    "Runtime.evaluate",
+    {
+      expression: `(() => {
+        const root = document.scrollingElement || document.documentElement;
+        const beforeY = window.scrollY || root.scrollTop || 0;
+        const targetY = Math.max(0, root.scrollHeight - window.innerHeight);
+        window.scrollTo({top: targetY, behavior: 'auto'});
+        return {beforeY, targetY, height: root.scrollHeight};
+      })()`,
+      returnByValue: true,
+    },
+  );
+  return result?.result?.value || null;
+}
+
+async function waitForProcessedPage(previousCount, timeoutMs = PAGE_RESPONSE_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (running && Date.now() < deadline) {
+    if (processedPageCount > previousCount) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+async function waitForCollectionContent(timeoutMs = INITIAL_LOADING_INDICATOR_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (running && Date.now() < deadline) {
+    const metrics = await getPageMetrics();
+    if ((metrics?.itemCount || 0) > 0) return metrics;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
+
+async function waitForPageGrowth(initialHeight, timeoutMs = SCROLL_LOAD_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (running && Date.now() < deadline) {
+    const metrics = await getPageMetrics();
+    if (metrics?.height > initialHeight + 10) return metrics;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
+
+async function waitForStableEnd(timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  let stableSince = null;
+  let previousHeight = null;
+  while (running && Date.now() < deadline) {
+    const metrics = await getPageMetrics();
+    if (!metrics || metrics.loading || !metrics.atBottom) {
+      stableSince = null;
+      previousHeight = metrics?.height ?? null;
+    } else if (metrics.height !== previousHeight) {
+      previousHeight = metrics.height;
+      stableSince = Date.now();
+    } else {
+      stableSince ??= Date.now();
+      if (Date.now() - stableSince >= 2000) return metrics;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
 }
 
 async function requestNextPage(url, nextMaxId, originalHeaders = {}) {
+  if (!USE_CURSOR_REQUESTS) return;
   if (!url || !nextMaxId || !url.includes("/api/v1/feed/collection/") || !url.includes("/posts/")) {
     return;
   }
@@ -222,12 +787,14 @@ async function requestNextPage(url, nextMaxId, originalHeaders = {}) {
     if (page && typeof page === "object") {
       countPageItems(outcome.body);
       matchingResponseCount += 1;
-      noResponseAttempts = 0;
       morePagesAvailable = page.more_available === undefined
         ? morePagesAvailable
         : Boolean(page.more_available);
       const payload = {
         source: "instagram-browser",
+        collector: "instagram-extension",
+        collection_id: collectionIdFromUrl(requestUrl),
+        collection_name: currentCollectionName,
         tab_url: `https://www.instagram.com/`,
         request_url: requestUrl,
         request_id: `cursor-${Date.now()}`,
@@ -238,8 +805,9 @@ async function requestNextPage(url, nextMaxId, originalHeaders = {}) {
       const key = pageKey(requestUrl);
       if (capturedPageKeys.has(key)) return;
       capturedPageKeys.add(key);
-      await storeCapture(payload);
-      await sendToLocalBackend(payload);
+      const pageIndex = processedPageCount;
+      await storeCapture(payload, pageIndex);
+      processedPageCount += 1;
       await appendLog("response_captured", {
         requestUrl,
         itemCount: page.items?.length || 0,
@@ -255,31 +823,18 @@ async function requestNextPage(url, nextMaxId, originalHeaders = {}) {
   }
 }
 
-async function sendToLocalBackend(payload) {
-  if (localBackendUnavailable) return false;
-  try {
-    const response = await fetch(LOCAL_BACKEND, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    if (!response.ok) {
-      throw new Error(`Backend returned HTTP ${response.status}`);
-    }
-    return true;
-  } catch (error) {
-    console.warn("InstaCinema local backend forwarding failed", error);
-    localBackendUnavailable = true;
-    sendStatus(`Saved locally; optional backend unavailable (${error.message}).`);
-    return false;
-  }
-}
-
-async function storeCapture(payload) {
+async function storeCapture(payload, pageIndex) {
   const stored = await chrome.storage.local.get({[CAPTURE_STORAGE_KEY]: []});
   const captures = stored[CAPTURE_STORAGE_KEY];
-  captures.push(payload);
+  const page = {
+    ...payload,
+    run_id: currentRunId,
+    page_index: pageIndex,
+    captured_at: new Date().toISOString(),
+  };
+  captures.push(page);
   await chrome.storage.local.set({[CAPTURE_STORAGE_KEY]: captures});
+  await queuePageUpload(page);
 }
 
 async function captureResponseBody(requestId, metadata) {
@@ -290,25 +845,46 @@ async function captureResponseBody(requestId, metadata) {
       {requestId},
     );
     let body = result.body;
-    if (metadata.mimeType.includes("json")) {
+    if (typeof body === "string") {
       try {
         body = JSON.parse(body);
       } catch {
-        // Keep the raw body when the endpoint labels invalid/non-JSON content.
+        // GraphQL responses are sometimes labelled text/javascript. Keep the
+        // raw body only when it is genuinely not JSON.
       }
     }
+    if (isGraphQLUrl(metadata.url) && !graphQLCollection(body)) {
+      await appendLog("graphql_response_ignored", {
+        requestUrl: metadata.url,
+        reason: "no_fetch_media_collection",
+        topLevelKeys: body && typeof body === "object" ? Object.keys(body) : [],
+      });
+      return;
+    }
+    let nextMaxId = null;
     if (body && typeof body === "object") {
-      const page = body.save_media_response || body;
+      const page = pageDetails(body);
       countPageItems(body);
-      if ("more_available" in page) {
-        morePagesAvailable = Boolean(page.more_available);
+      if (page.moreAvailable !== undefined) {
+        morePagesAvailable = Boolean(page.moreAvailable);
       }
-      if (page.more_available && page.next_max_id) {
-        await requestNextPage(metadata.url, page.next_max_id, metadata.requestHeaders);
-      }
+      nextMaxId = page.moreAvailable && page.nextCursor ? page.nextCursor : null;
+      console.info("InstaCinema collection page", {
+        url: metadata.url,
+        itemCount: page.items.length,
+        moreAvailable: page.moreAvailable,
+        hasNextCursor: Boolean(page.nextCursor),
+      });
     }
     const payload = {
       source: "instagram-browser",
+      collector: "instagram-extension",
+      collection_id: collectionIdFromUrl(metadata.url)
+        || String(graphQLCollection(body)?.id || "")
+        || collectionIdFromPostData(metadata.postData)
+        || collectionIdFromHeaders(metadata.requestHeaders)
+        || null,
+      collection_name: currentCollectionName,
       tab_url: metadata.tabUrl,
       request_url: metadata.url,
       request_id: requestId,
@@ -316,15 +892,20 @@ async function captureResponseBody(requestId, metadata) {
       mime_type: metadata.mimeType,
       body,
     };
-    const key = pageKey(metadata.url);
+    const key = pageKey(metadata.url, metadata.postData, body);
     if (capturedPageKeys.has(key)) return;
     capturedPageKeys.add(key);
     await appendLog("response_captured", {
       requestUrl: metadata.url,
-      itemCount: body?.items?.length || body?.save_media_response?.items?.length || 0,
+      itemCount: pageDetails(body).items.length,
     });
-    await storeCapture(payload);
-    await sendToLocalBackend(payload);
+    const pageIndex = processedPageCount;
+    await storeCapture(payload, pageIndex);
+    processedPageCount += 1;
+    // Raw uploads and normalization are independent of Instagram pagination.
+    if (nextMaxId) {
+      await requestNextPage(metadata.url, nextMaxId, metadata.requestHeaders);
+    }
   } catch (error) {
     console.warn("Could not retrieve response body", requestId, error);
   }
@@ -347,6 +928,19 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!running || source.tabId !== activeTabId) {
     return;
   }
+  if (method === "Network.loadingFailed") {
+    if (targetRequestsById.has(params.requestId)) {
+      appendLog("target_response_failed", {
+        requestId: params.requestId,
+        errorText: params.errorText,
+        canceled: params.canceled,
+        blockedReason: params.blockedReason,
+      }).catch(() => {});
+      targetRequestsById.delete(params.requestId);
+      requestHeadersById.delete(params.requestId);
+    }
+    return;
+  }
   if (method === "Network.loadingFinished") {
     const metadata = pendingResponseBodies.get(params.requestId);
     if (metadata) {
@@ -361,8 +955,17 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     return;
   }
   if (method === "Network.requestWillBeSent") {
-    if (endpointMatches(params.request?.url || "")) {
+    if (requestMatches(params.request)) {
+      appendLog("target_request_observed", {
+        requestId: params.requestId,
+        requestUrl: params.request.url,
+        isGraphQL: isGraphQLUrl(params.request.url),
+        hasPostData: Boolean(params.request.postData),
+      }).catch(() => {});
       requestHeadersById.set(params.requestId, params.request.headers || {});
+      targetRequestsById.set(params.requestId, {
+        postData: params.request.postData || "",
+      });
     }
     return;
   }
@@ -378,23 +981,39 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   // Chrome's response buffer on large collections.
   try {
     const responseUrl = new URL(response.url);
-    if (responseUrl.pathname.includes("/all/") || responseUrl.searchParams.get("max_id")) {
+    if (USE_CURSOR_REQUESTS
+      && (responseUrl.pathname.includes("/all/") || responseUrl.searchParams.get("max_id"))) {
       return;
     }
   } catch {
     return;
   }
   if (DISCOVERY_MODE) {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(response.url);
+    } catch {
+      parsedUrl = null;
+    }
     console.info("InstaCinema network discovery", {
       type: params.type,
       url: response.url,
+      pathname: parsedUrl?.pathname,
+      hasMaxId: Boolean(parsedUrl?.searchParams.get("max_id")),
       status: response.status,
       mimeType: response.mimeType,
     });
   }
-  if (!endpointMatches(response.url)) {
+  const targetRequest = targetRequestsById.get(params.requestId);
+  if (!endpointMatches(response.url) && !isGraphQLUrl(response.url)) {
     return;
   }
+  appendLog("target_response_observed", {
+    requestId: params.requestId,
+    requestUrl: response.url,
+    status: response.status,
+    mimeType: response.mimeType,
+  }).catch(() => {});
   matchingResponseCount += 1;
   pendingResponseBodies.set(params.requestId, {
     tabUrl: response.url,
@@ -402,12 +1021,15 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     status: response.status,
     mimeType: response.mimeType || "",
     requestHeaders: requestHeadersById.get(params.requestId) || {},
+    postData: targetRequest?.postData || "",
   });
   requestHeadersById.delete(params.requestId);
+  targetRequestsById.delete(params.requestId);
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId === activeTabId) {
+    appendLog("debugger_detached", {reason}).catch(() => {});
     running = false;
     activeTabId = null;
     clearInterval(scrollTimer);
@@ -420,44 +1042,123 @@ async function start(tab) {
   if (!tab?.id || !tab.url?.includes("instagram.com")) {
     return {message: "Open Instagram in the active tab first.", running: false};
   }
+  const collectionPk = collectionIdFromSavedUrl(tab.url);
+  if (!collectionPk) {
+    return {message: "Open a specific Instagram saved collection first.", running: false};
+  }
   if (running) {
     return {message: "Collection is already running.", running: true};
   }
   activeTabId = tab.id;
-  try {
-    await chrome.debugger.attach({tabId: activeTabId}, "1.3");
-    await chrome.debugger.sendCommand({tabId: activeTabId}, "Network.enable");
-  } catch (error) {
-    activeTabId = null;
-    return {message: `Could not attach debugger: ${error.message}`, running: false};
+  if (!SCROLL_ONLY_MODE) {
+    try {
+      await chrome.debugger.attach({tabId: activeTabId}, "1.3");
+      await chrome.debugger.sendCommand({tabId: activeTabId}, "Network.enable");
+    } catch (error) {
+      activeTabId = null;
+      return {message: `Could not attach debugger: ${error.message}`, running: false};
+    }
   }
   running = true;
   scrollInFlight = false;
+  scrollStepCount = 0;
   matchingResponseCount = 0;
-  noResponseAttempts = 0;
+  processedPageCount = 0;
   morePagesAvailable = null;
   cursorRequestFailures = 0;
   currentCollectionName = collectionNameFromUrl(tab.url);
-  localBackendUnavailable = false;
+  currentCollectionPk = collectionPk;
+  currentRunId = crypto.randomUUID();
+  currentStartedAt = new Date().toISOString();
   pendingResponseBodies.clear();
   requestHeadersById.clear();
+  targetRequestsById.clear();
   requestedPageUrls.clear();
   capturedPageKeys.clear();
   capturedPostIds.clear();
   await chrome.storage.local.set({[CAPTURE_STORAGE_KEY]: []});
   await chrome.storage.local.set({[LOG_STORAGE_KEY]: []});
+  await chrome.storage.local.remove(LAST_RUN_STORAGE_KEY);
   await appendLog("run_started", {tabId: activeTabId, url: tab.url});
+  await queueRunStart();
   await setPageOverlay("Collecting posts…", true);
-  sendStatus("Capturing responses and following pagination cursors.");
+  if (SCROLL_ONLY_MODE) {
+    sendStatus("Scroll-only mode: waiting for Instagram to render.");
+    const reloadCompleted = await reloadTabAndWaitForCompletion();
+    if (!reloadCompleted) {
+      await stop("document_ready_timeout");
+      return {message: "Instagram did not finish loading.", running: false};
+    }
+    const initialContent = await waitForCollectionContent();
+    if (!initialContent) {
+      await stop("collection_content_timeout");
+      return {message: "Instagram did not render the collection posts.", running: false};
+    }
+    await appendLog("initial_collection_rendered", initialContent);
+    await setPageOverlay("Finding the next loading indicator…", true);
+    requestScrollOnly();
+    return {message: "Scroll-only mode started.", running: true};
+  }
+  sendStatus(USE_CURSOR_REQUESTS
+    ? "Capturing responses and following pagination cursors."
+    : "Capturing responses with infinite scrolling.");
   // The initial collection request may have happened before the debugger was
   // attached. Reload so that request is emitted while Network capture is on.
   await chrome.tabs.reload(activeTabId);
-  await new Promise((resolve) => setTimeout(resolve, 1800));
-  if (running) {
-    await setPageOverlay("Collecting posts…", true);
+  sendStatus("Waiting for the initial collection response.");
+  const receivedInitialPage = await waitForProcessedPage(0);
+  if (!running) {
+    return {message: "Stopped.", running: false};
   }
+  if (!receivedInitialPage) {
+    sendStatus("The initial collection response did not appear; stopping.");
+    await stop("initial_collection_response_timeout");
+    return {message: "Initial collection response timed out.", running: false};
+  }
+  sendStatus("Initial page recorded locally; backend upload queued.");
+  await setPageOverlay("Collecting posts…", true);
   requestScroll();
   return {message: "Started.", running: true};
+}
+
+async function requestScrollOnly() {
+  if (!running || activeTabId === null || scrollInFlight) return;
+  scrollInFlight = true;
+  try {
+    const before = await getPageMetrics();
+    const bottomScroll = await scrollToCurrentBottom();
+    scrollStepCount += 1;
+    await appendLog("scrolled_to_current_bottom", {
+      step: scrollStepCount,
+      ...bottomScroll,
+    });
+    sendStatus(`Scrolled to the current bottom; waiting for more posts…`);
+    const grownPage = await waitForPageGrowth(before?.height || 0);
+    if (!grownPage) {
+      const finalMetrics = await waitForStableEnd();
+      if (finalMetrics) {
+        sendStatus("The page is stable at the bottom; scrolling is complete.");
+        await stop("stable_end_at_bottom", finalMetrics);
+      } else {
+        sendStatus("The page did not grow or settle at the bottom; stopping with an error.");
+        await stop("page_growth_timeout", {before, current: await getPageMetrics()});
+      }
+      return;
+    }
+    await appendLog("page_height_grew", {
+      step: scrollStepCount,
+      previousHeight: before?.height,
+      currentHeight: grownPage.height,
+    });
+  } catch (error) {
+    console.warn("Scroll-only loop failed", error);
+    sendStatus(`Scrolling failed: ${error.message}`);
+    await stop("scroll_loop_error", {error: error.message});
+    return;
+  } finally {
+    scrollInFlight = false;
+    if (running) scrollTimer = setTimeout(requestScrollOnly, 100);
+  }
 }
 
 async function requestScroll() {
@@ -465,66 +1166,90 @@ async function requestScroll() {
     return;
   }
   scrollInFlight = true;
-  const responsesBeforeGesture = matchingResponseCount;
   try {
-    // Pagination is driven by next_max_id from the captured response.
-    // Use a real gesture only when cursor pagination has failed.
-    if (cursorRequestFailures > 0) {
-      await chrome.debugger.sendCommand(
-        {tabId: activeTabId},
-        "Input.synthesizeScrollGesture",
-        {x: 100, y: 150, yDistance: -3000, speed: 25000, gestureSourceType: "mouse"},
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, RESPONSE_WAIT_MS));
-    await waitForCaptureTasks();
     if (morePagesAvailable === false) {
+      console.info("InstaCinema stopping: Instagram reported no more collection pages");
       sendStatus("Instagram reported no more pages; finishing capture.");
-      await stop();
+      await stop("instagram_no_more_pages");
       return;
     }
-    if (morePagesAvailable === true && cursorRequestFailures === 0) {
-      // Cursor pagination is active; do not apply the fallback timeout while
-      // its next-page requests are still being processed.
-      noResponseAttempts = 0;
-    } else {
-      if (matchingResponseCount === responsesBeforeGesture) {
-        noResponseAttempts += 1;
-      } else {
-        noResponseAttempts = 0;
-      }
-      if (noResponseAttempts >= MAX_NO_RESPONSE_ATTEMPTS) {
-        sendStatus("No matching next-page response appeared; stopping.");
-        await stop();
-      }
+
+    const pagesBeforeScroll = processedPageCount;
+    const before = await getPageMetrics();
+    const bottomScroll = await scrollToCurrentBottom();
+    scrollStepCount += 1;
+    await appendLog("scrolled_to_current_bottom", {
+      step: scrollStepCount,
+      before,
+      ...bottomScroll,
+    });
+    console.info("InstaCinema scrolled to current bottom", {
+      processedPageCount,
+      matchingResponseCount,
+    });
+    sendStatus("Waiting for the next collection response.");
+    const receivedPage = await waitForProcessedPage(pagesBeforeScroll);
+    if (!receivedPage) {
+      sendStatus("No collection response appeared after scrolling; stopping.");
+      await stop("collection_response_timeout_after_scroll");
+      return;
     }
+    sendStatus(`Page ${processedPageCount} recorded locally; backend upload queued.`);
   } catch (error) {
-    console.warn("Scroll request failed", error);
+    console.warn("Collection page loop failed", error);
+    sendStatus(`Collection failed: ${error.message}`);
+    await stop("collection_loop_error", {error: error.message});
   } finally {
     scrollInFlight = false;
     if (running) {
-      scrollTimer = setTimeout(requestScroll, 250);
+      scrollTimer = setTimeout(requestScroll, 100);
     }
   }
 }
 
-async function stop() {
+function captureStatusForReason(reason) {
+  if (reason === "instagram_no_more_pages" || reason === "stable_end_at_bottom") {
+    return "completed";
+  }
+  if (reason === "stopped_by_user") return "stopped";
+  return "failed";
+}
+
+async function stop(reason = "stopped_by_user", details = {}) {
   if (!running || activeTabId === null) {
     return {message: "Collection is not running.", running: false};
   }
+  const summary = {
+    run_id: currentRunId,
+    collection_name: currentCollectionName,
+    reason,
+    details,
+    pages_recorded: processedPageCount,
+    unique_items: capturedPostIds.size,
+    capture_status: captureStatusForReason(reason),
+    stopped_at: new Date().toISOString(),
+  };
+  await appendLog("run_stopping", summary);
+  await chrome.storage.local.set({[LAST_RUN_STORAGE_KEY]: summary});
+  console.info("InstaCinema stopped", summary);
   clearInterval(scrollTimer);
   clearTimeout(scrollTimer);
   scrollTimer = null;
-  // Let Network.loadingFinished handlers finish reading and storing the last body.
-  await new Promise((resolve) => setTimeout(resolve, 1200));
-  await waitForCaptureTasksWithTimeout();
+  if (!SCROLL_ONLY_MODE) {
+    await waitForCaptureTasksWithTimeout(250);
+  }
+  summary.pages_recorded = processedPageCount;
+  summary.unique_items = capturedPostIds.size;
+  summary.finished_at = new Date().toISOString();
+  await chrome.storage.local.set({[LAST_RUN_STORAGE_KEY]: summary});
+  await appendLog("run_stopped", summary);
   running = false;
   scrollInFlight = false;
-  noResponseAttempts = 0;
   morePagesAvailable = null;
   cursorRequestFailures = 0;
   pendingResponseBodies.clear();
   requestHeadersById.clear();
+  targetRequestsById.clear();
   requestedPageUrls.clear();
   capturedPageKeys.clear();
   const tabId = activeTabId;
@@ -534,34 +1259,66 @@ async function stop() {
     console.warn("Could not remove page overlay", error);
   }
   activeTabId = null;
-  try {
-    await chrome.debugger.detach({tabId});
-  } catch (error) {
-    console.warn("Debugger detach failed", error);
+  if (!SCROLL_ONLY_MODE) {
+    try {
+      await chrome.debugger.detach({tabId});
+    } catch (error) {
+      console.warn("Debugger detach failed", error);
+    }
   }
   try {
-    await exportCaptures();
-    await appendLog("run_finished");
+    if (!SCROLL_ONLY_MODE) await exportCaptures(summary);
+    await appendLog("run_finished", summary);
   } catch (error) {
     console.warn("Automatic capture export failed", error);
     sendStatus(`Stopped, but automatic export failed: ${error.message}`);
-    return {message: "Stopped, but export failed.", running: false};
   }
-  sendStatus("Stopped and saved captures to Downloads.");
-  return {message: "Stopped and saved captures.", running: false};
+  await queueRunFinish(summary);
+  processedPageCount = 0;
+  const message = SCROLL_ONLY_MODE
+    ? "Scrolling stopped. No responses were captured."
+    : `Capture finished locally (${summary.unique_items} items); cloud uploads continue in the background.`;
+  sendStatus(message);
+  return {message, running: false};
 }
 
 chrome.action.onClicked.addListener(async (tab) => {
   if (running) {
-    await stop();
+    await stop("stopped_by_user");
   } else {
     await start(tab);
   }
 });
 
-async function exportCaptures() {
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === OUTBOX_ALARM) scheduleOutboxPump();
+});
+
+chrome.runtime.onStartup.addListener(scheduleOutboxPump);
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create(OUTBOX_ALARM, {periodInMinutes: 1});
+  scheduleOutboxPump();
+});
+
+chrome.alarms.create(OUTBOX_ALARM, {periodInMinutes: 1});
+scheduleOutboxPump();
+
+async function exportCaptures(summary = null) {
   const stored = await chrome.storage.local.get({[CAPTURE_STORAGE_KEY]: []});
-  const data = JSON.stringify(stored[CAPTURE_STORAGE_KEY], null, 2);
+  const pages = stored[CAPTURE_STORAGE_KEY];
+  const snapshot = {
+    run_id: summary?.run_id || currentRunId,
+    platform: "instagram",
+    collector: "instagram-extension",
+    collection_name: currentCollectionName,
+    collection_pk: String(currentCollectionPk
+      || pages.find((page) => page.collection_id)?.collection_id
+      || ""),
+    capture_status: summary?.capture_status || "running",
+    page_count: pages.length,
+    pages,
+  };
+  const data = JSON.stringify(snapshot, null, 2);
   const url = `data:application/json;charset=utf-8,${encodeURIComponent(data)}`;
   const safeName = currentCollectionName.replace(/[^a-z0-9 _-]/gi, "_").trim() || "Collection";
   const timestamp = formatLocalTimestamp().replace(/:/g, "-");
@@ -570,7 +1327,7 @@ async function exportCaptures() {
     filename: `Instagram - ${safeName} (${timestamp}).json`,
     saveAs: false,
   });
-  return {message: `Exported ${stored[CAPTURE_STORAGE_KEY].length} captures.`};
+  return {message: `Exported ${pages.length} captured pages.`};
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -580,7 +1337,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === "stop") {
-    stop().then(sendResponse);
+    stop("stopped_by_user").then(sendResponse);
     return true;
   }
   if (message.type === "export") {

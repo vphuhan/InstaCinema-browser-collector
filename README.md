@@ -1,72 +1,98 @@
 # InstaCinema Browser Collector
 
-This is a local proof of concept for collecting data from a user-authenticated Instagram tab without asking the user to copy cookies or parsing rendered HTML.
+A Chromium extension that exports the posts in an Instagram saved collection
+as JSON. It works from your existing Instagram browser session, so it does not
+ask for your password, cookies, or session ID.
 
-## Current design
+The local JSON export works without the InstaCinema backend. When the optional
+local ingestion API is available at `http://127.0.0.1:8000`, captured pages are
+also uploaded in the background for storage and normalization.
+
+## Install
+
+1. Download or clone this repository.
+2. Open `chrome://extensions` in Chrome, or `brave://extensions` in Brave.
+3. Enable **Developer mode**.
+4. Select **Load unpacked** and choose this repository's folder.
+5. Pin **InstaCinema Browser Collector** to the browser toolbar.
+
+No build step or package installation is required.
+
+## Collect a saved collection
+
+1. Sign in to [Instagram](https://www.instagram.com/) normally.
+2. Open one specific saved collection. Its URL should resemble:
+   `https://www.instagram.com/<username>/saved/<name>/<collection-id>/`.
+3. Click the InstaCinema toolbar icon.
+4. Leave that tab open while the dim capture overlay is visible.
+5. Wait for the extension to finish, or click the icon again to stop early.
+
+The extension reloads the selected tab, follows Instagram's collection
+pagination, and downloads the captured pages automatically as:
 
 ```text
-User opens Instagram and logs in normally
-        ↓
-User clicks Start in this extension
-        ↓
-Extension attaches Chrome DevTools Protocol to that tab
-        ↓
-Extension triggers small scrolls
-        ↓
-Instagram makes its normal authenticated requests
-        ↓
-Extension captures matching response bodies
-        ↓
-Extension forwards them to localhost only
+Instagram - <Collection name> (YYYY-MM-DD HH-MM-SS).json
 ```
 
-The extension currently filters the private collection endpoint names found in the installed `aiograpi` package:
+Stopping early still exports everything captured so far.
 
-- `/api/v1/collections/list/`
-- `/api/v1/feed/collection/`
-- `/api/v1/feed/saved/posts/`
+## Status badge
 
-The browser may use different web endpoints. Add confirmed patterns to `service_worker.js` under `PLACEHOLDER_ENDPOINT_PATTERNS` after observing them in DevTools.
+- Blue number: unique items captured in the active run.
+- Purple number: captured items still waiting for the optional local API.
+- `RUN`: capture has started but no items have been received yet.
+- `↑`: background ingestion is active without an available item count.
+- `OFF`: capture is idle and there are no pending uploads.
+- `!`: the local API rejected an upload that needs inspection.
 
-## Local installation
+Large counts are shortened to fit the badge, such as `1.2K` or `12K`.
 
-1. Open `chrome://extensions`.
-2. Enable Developer mode.
-3. Click **Load unpacked**.
-4. Select this `browser_extension/` directory.
-5. Open Instagram, navigate to the relevant collection, and click the extension.
-6. Click the extension icon to start collection automatically. Use the popup's **Stop** button when finished. The extension uses Chrome DevTools Protocol gestures; it does not parse the page HTML.
+## Output
 
-The extension sends a fast, large Chrome DevTools Protocol scroll gesture from inside the visible viewport, waits briefly for matching network activity, and only then sends the next gesture. It stops after eight gestures without a matching response. This follows the usual infinite-scroll automation pattern: trigger scrolling, wait for the concrete next-page response, then continue.
-
-Chrome will show a powerful debugger permission warning. This extension is intended for local personal development only. It does not read cookies and does not send captured data outside `http://127.0.0.1:8000`.
-
-## Backend contract
-
-The backend endpoint is not implemented yet. The extension sends one JSON envelope per matching response:
+The downloaded file contains run metadata and the Instagram response pages:
 
 ```json
 {
-  "source": "instagram-browser",
-  "tab_url": "https://www.instagram.com/...",
-  "request_url": "https://www.instagram.com/api/...",
-  "request_id": "123.45",
-  "status": 200,
-  "mime_type": "application/json",
-  "body": {}
+  "run_id": "...",
+  "platform": "instagram",
+  "collector": "instagram-extension",
+  "collection_name": "Film",
+  "collection_pk": "...",
+  "capture_status": "completed",
+  "page_count": 6,
+  "pages": []
 }
 ```
 
-Until the backend endpoint exists, forwarding failures are shown in the extension status and the payload remains visible in the service-worker console for local debugging.
+Each page is written to `chrome.storage.local` before any upload is attempted.
+If the optional API is offline, the local export still completes and pending
+uploads remain in the extension's outbox for a later retry.
 
-Captured response envelopes are also stored in `chrome.storage.local`. Use the popup's **Save as** field and **Export JSON** button to download them. Chrome accepts a path relative to the user's Downloads directory, such as `instacinema/instagram-captures.json`; an arbitrary absolute filesystem path is not permitted by the extension API.
+## Optional local API
 
-While `DISCOVERY_MODE` is enabled, the service-worker console also logs metadata for every XHR/fetch response from the attached Instagram tab. Use that log to identify the browser-specific collection endpoint, then add its path to `PLACEHOLDER_ENDPOINT_PATTERNS` and disable discovery when you no longer need it.
+The extension sends ingestion requests only to `http://127.0.0.1:8000`:
 
-## Security boundary
+- `POST /api/v1/ingestion/runs`
+- `PUT /api/v1/ingestion/runs/{run_id}/pages/{page_index}`
+- `POST /api/v1/ingestion/runs/{run_id}/finish`
 
-- No password or cookie extraction.
-- No external upload endpoint.
-- Only the user-selected tab is attached.
-- The user must explicitly start collection.
-- Captured responses may contain private account data; do not commit them.
+Cloud credentials never belong in the extension. A compatible local API is
+responsible for authentication, object storage, and downstream processing.
+
+## Permissions and privacy
+
+- `debugger`: observes the selected Instagram tab's collection responses.
+- `activeTab` and `scripting`: controls scrolling only in the selected tab.
+- `storage` and `unlimitedStorage`: keeps captured pages and pending uploads.
+- `downloads`: writes the completed JSON file.
+- `alarms`: resumes pending local-API uploads.
+
+Chromium displays a debugger notification while capture is active. The
+extension detaches when capture finishes or is stopped. Captures can contain
+private saved-post information, so review the JSON before sharing it and do not
+commit personal capture files to Git.
+
+## Update
+
+After pulling a newer version, open the browser's extensions page and click
+**Reload** on the InstaCinema extension card.

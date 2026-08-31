@@ -5,8 +5,10 @@
   "version": "0.1.0",
   "permissions": [
     "activeTab",
+    "alarms",
     "debugger",
     "downloads",
+    "scripting",
     "storage",
     "unlimitedStorage"
   ],
@@ -26,6 +28,15 @@
       "32": "icons/icon.png",
       "48": "icons/icon.png",
       "128": "icons/icon.png"
+    }
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+8",
+        "mac": "Command+Shift+8"
+      },
+      "description": "Start or stop InstaCinema collection capture"
     }
   },
   "icons": {
